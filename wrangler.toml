@@ -1,0 +1,23 @@
+name = "ice-proxy"
+main = "src/worker.js"
+compatibility_date = "2024-09-23"
+
+# 1. Create KV namespace:
+#    npx wrangler kv namespace create ACCOUNTS
+# 2. Paste the returned id below:
+# [[kv_namespaces]]
+# binding = "ACCOUNTS"
+# id = "your_kv_id"
+
+# 3. Set secrets (one of these patterns):
+#    npx wrangler secret put OPENAI_API_KEYS     -- "sk-xxx,sk-yyy"
+#    npx wrangler secret put ADMIN_SECRET        -- "your-admin-secret"
+#    npx wrangler secret put GEMINI_API_KEY      -- "AIzaSy..."
+#    npx wrangler secret put GLM_API_KEY         -- "glm-xxx.bigmodel.cn"
+#    npx wrangler secret put CEREBRAS_API_KEY    -- "csk-xxx"
+#    npx wrangler secret put OPENROUTER_API_KEY  -- "sk-or-xxx"
+#
+#    (if any of these are unset, that provider's models will be unavailable)
+
+[vars]
+DEFAULT_MODEL = "qwen/qwen3-coder-flash"
