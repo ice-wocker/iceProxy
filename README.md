@@ -1,4 +1,19 @@
-# iceProxy
+<p align="center">
+  <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
+  <img src="https://img.shields.io/badge/Cloudflare-Workers-orange" alt="Cloudflare Workers">
+  <img src="https://img.shields.io/badge/models-28%2B-brightgreen" alt="28+ Models">
+  <img src="https://img.shields.io/badge/JavaScript-ES2022-yellow" alt="JS">
+  <img src="https://img.shields.io/github/stars/ice-wocker/iceProxy?style=social" alt="Stars">
+  <img src="https://img.shields.io/github/forks/ice-wocker/iceProxy?style=social" alt="Forks">
+</p>
+
+<h1 align="center">iceProxy</h1>
+
+<p align="center">
+  <b>OpenAI-compatible API for 7 free AI models in one endpoint</b><br>
+  <sub>Qwen3-Max · GLM-5.3 · DeepSeek-V4 · GPT-OSS-120B · Llama-4 · Kimi-K3</sub>
+</p>
+
 
 **OpenAI-compatible API for 5 free AI models · Cloudflare Workers · 0 cold start**
 
@@ -186,3 +201,13 @@ With 5 Qwen accounts you get **10,000 req/day** for free.
 ## License
 
 MIT
+
+## ⭐ Star History
+
+<a href="https://star-history.com/#ice-wocker/iceProxy&Timeline">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=ice-wocker/iceProxy&type=Timeline&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=ice-wocker/iceProxy&type=Timeline" />
+    <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=ice-wocker/iceProxy&type=Timeline" />
+  </picture>
+</a>
