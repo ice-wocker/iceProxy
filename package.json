@@ -10,7 +10,7 @@
     "auth:list": "node scripts/auth.js list",
     "auth:deploy": "node scripts/auth.js deploy",
     "auth:list-kv": "node scripts/auth.js list-kv",
-    "test": "node --test \"test/*.test.mjs\""
+    "test": "node --test test/*.test.mjs"
   },
   "devDependencies": {
     "wrangler": "^3.80.0"
