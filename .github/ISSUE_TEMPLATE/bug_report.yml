@@ -1,0 +1,47 @@
+name: 🐞 Bug 报告
+description: 报告一个可复现的问题
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量把信息填完整，便于定位问题。
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 问题描述
+      description: 发生了什么？你期望发生什么？
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 打开 …
+        2. 点击 …
+        3. 出现 …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本 / 提交
+      description: 应用版本号，或 commit SHA
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: 设备与系统
+      placeholder: 例如 Pixel 7 / Android 14，或 Termux 版本
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志 / 截图
+      description: 粘贴崩溃日志、logcat，或贴截图。敏感信息请先脱敏。
+    validations:
+      required: false

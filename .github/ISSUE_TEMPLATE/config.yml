@@ -1,0 +1,5 @@
+blank_issues_enabled: true
+contact_links:
+  - name: 📖 阅读项目说明
+    url: https://github.com/ice-wocker?tab=repositories
+    about: 先看看 README 和其他 Issue，很多问题已有答案
