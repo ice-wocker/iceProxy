@@ -1,7 +1,7 @@
 {
   "name": "ice-proxy",
   "version": "1.0.0",
-  "description": "OpenAI-compatible proxy for 5 free AI models (Qwen OAuth, Gemini, GLM, Cerebras, OpenRouter)",
+  "description": "OpenAI-compatible proxy for 8 free AI models across 5 providers (Qwen OAuth x3, Gemini x2, GLM, Cerebras, OpenRouter)",
   "main": "src/worker.js",
   "scripts": {
     "deploy": "wrangler deploy",

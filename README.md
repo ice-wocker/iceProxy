@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
   <img src="https://img.shields.io/badge/Cloudflare-Workers-orange" alt="Cloudflare Workers">
-  <img src="https://img.shields.io/badge/models-28%2B-brightgreen" alt="28+ Models">
+  <img src="https://img.shields.io/badge/models-8-brightgreen" alt="8 Models">
   <img src="https://img.shields.io/badge/JavaScript-ES2022-yellow" alt="JS">
   <img src="https://img.shields.io/github/stars/ice-wocker/iceProxy?style=social" alt="Stars">
   <img src="https://img.shields.io/github/forks/ice-wocker/iceProxy?style=social" alt="Forks">
@@ -10,12 +10,12 @@
 <h1 align="center">iceProxy</h1>
 
 <p align="center">
-  <b>OpenAI-compatible API for 7 free AI models in one endpoint</b><br>
-  <sub>Qwen3-Max · GLM-5.3 · DeepSeek-V4 · GPT-OSS-120B · Llama-4 · Kimi-K3</sub>
+  <b>OpenAI-compatible API for 8 free AI models in one endpoint</b><br>
+  <sub>Qwen3-Coder-Plus · Qwen3-Coder-Flash · Qwen-Vision · Gemini-2.0-Flash · Gemini-1.5-Flash · GLM-4.5-Flash · Cerebras-Qwen3-32B · OpenRouter-Auto</sub>
 </p>
 
 
-**OpenAI-compatible API for 5 free AI models · Cloudflare Workers · 0 cold start**
+**OpenAI-compatible API for 8 free AI models across 5 providers · Cloudflare Workers · 0 cold start**
 
 iceProxy is a single-file Cloudflare Worker that exposes free-tier AI models as an OpenAI-compatible API. It supports **multi-account rotation** for the Qwen free tier (2000 req/day × N accounts) and **fallback** across providers for high availability.
 
@@ -154,7 +154,7 @@ const r = await client.chat.completions.create({
 Set:
 - **API Base URL**: `https://ice-proxy.YOUR.workers.dev/v1`
 - **API Key**: your `OPENAI_API_KEYS` value
-- **Model**: any of the 8+ listed (e.g. `qwen/qwen3-coder-flash`)
+- **Model**: any of the 8 listed (e.g. `qwen/qwen3-coder-flash`)
 
 ## Models
 
