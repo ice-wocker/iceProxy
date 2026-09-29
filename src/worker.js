@@ -416,6 +416,9 @@ async function handleAdminHealth(req, env, pool) {
 }
 
 // ---- Main handler ----
+// 供单元测试使用的具名导出（Cloudflare Worker 运行时只认 default）
+export { PROVIDERS, DEFAULT_MODEL, checkApiKey, corsHeaders };
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
