@@ -2,7 +2,7 @@
 // 运行：npm test
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { PROVIDERS, DEFAULT_MODEL, checkApiKey, corsHeaders } from "../src/worker.js";
+import { PROVIDERS, DEFAULT_MODEL, checkApiKey, corsHeaders, toGeminiContents } from "../src/worker.js";
 
 // 每个 provider 前缀对应的密钥环境变量名，与 handleChat 里的分支保持一致
 const KEY_ENV_BY_PREFIX = {
@@ -96,4 +96,58 @@ test("corsHeaders 允许 POST 与 Authorization 头", () => {
   const h = corsHeaders();
   assert.match(h["Access-Control-Allow-Methods"], /POST/);
   assert.match(h["Access-Control-Allow-Headers"], /Authorization/);
+});
+
+// ---- Gemini 协议转换 ----
+// 这里曾有个真实 bug：只取最后一条消息，多轮历史被整段丢弃。
+// Cline / Cursor 每次都带完整历史，等于每次让模型失忆。
+
+test("toGeminiContents 保留完整多轮历史，不丢上下文", () => {
+  const { contents } = toGeminiContents([
+    { role: "user", content: "Q1" },
+    { role: "assistant", content: "A1" },
+    { role: "user", content: "Q2" }
+  ]);
+  assert.deepEqual(contents, [
+    { role: "user", parts: [{ text: "Q1" }] },
+    { role: "model", parts: [{ text: "A1" }] },
+    { role: "user", parts: [{ text: "Q2" }] }
+  ]);
+});
+
+test("toGeminiContents 把 assistant 映射成 Gemini 的 model 角色", () => {
+  const { contents } = toGeminiContents([{ role: "assistant", content: "hi" }]);
+  assert.equal(contents[0].role, "model");
+});
+
+test("toGeminiContents 把 system 提出来放进 systemInstruction，不混进 contents", () => {
+  const { contents, systemParts } = toGeminiContents([
+    { role: "system", content: "你是助手" },
+    { role: "user", content: "你好" }
+  ]);
+  assert.deepEqual(systemParts, ["你是助手"]);
+  assert.equal(contents.length, 1);
+  assert.equal(contents[0].role, "user");
+});
+
+test("多条 system 会被合并", () => {
+  const { systemParts } = toGeminiContents([
+    { role: "system", content: "A" },
+    { role: "system", content: "B" },
+    { role: "user", content: "x" }
+  ]);
+  assert.deepEqual(systemParts, ["A", "B"]);
+});
+
+test("空/异常 messages 不能让 contents 为空（Gemini 会 400）", () => {
+  assert.equal(toGeminiContents([]).contents.length, 1);
+  assert.equal(toGeminiContents(null).contents.length, 1);
+  assert.equal(toGeminiContents(undefined).contents.length, 1);
+});
+
+test("非字符串 content 兜底成字符串，不抛异常", () => {
+  const { contents } = toGeminiContents([
+    { role: "user", content: [{ type: "text", text: "hi" }] }
+  ]);
+  assert.equal(typeof contents[0].parts[0].text, "string");
 });

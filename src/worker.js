@@ -253,21 +253,52 @@ async function callQwenOAuth(req, env, pool) {
   return r;
 }
 
+/**
+ * 把 OpenAI 格式的 messages 转成 Gemini 的 contents。
+ *
+ * <p>此前的实现只取 messages 的最后一条——多轮对话的历史被整段丢弃，
+ * 而 Cline / Cursor 这类客户端每次请求都会带上完整历史，等于每次
+ * 都让模型失忆。这里按 OpenAI 语义完整映射：
+ *   - system 消息 → Gemini 的 systemInstruction（它不属于 contents）
+ *   - assistant → model（Gemini 的助手角色叫 model，不叫 assistant）
+ *   - user → user
+ *   - 多条 system 合并；非字符串 content 兜底转成字符串
+ */
+function toGeminiContents(messages) {
+  const contents = [];
+  const systemParts = [];
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (!m) continue;
+    const text = typeof m.content === "string"
+      ? m.content
+      : (m.content == null ? "" : JSON.stringify(m.content));
+    if (m.role === "system") {
+      if (text) systemParts.push(text);
+      continue;
+    }
+    const role = m.role === "assistant" ? "model" : "user";
+    contents.push({ role, parts: [{ text }] });
+  }
+  // Gemini 要求 contents 非空且首条为 user
+  if (contents.length === 0) contents.push({ role: "user", parts: [{ text: "" }] });
+  return { contents, systemParts };
+}
+
 async function callGemini(req, env) {
   const modelId = req.model.replace(/^gemini\//, "");
-  const msg = req.messages[req.messages.length - 1];
-  const contents = [{
-    role: "user",
-    parts: [{ text: msg.content || "" }]
-  }];
+  const { contents, systemParts } = toGeminiContents(req.messages);
+  const payload = {
+    contents,
+    generationConfig: { temperature: 0.7, maxOutputTokens: 8192 }
+  };
+  if (systemParts.length) {
+    payload.systemInstruction = { parts: [{ text: systemParts.join("\n\n") }] };
+  }
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${env.GEMINI_API_KEY}`;
   const r = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      contents,
-      generationConfig: { temperature: 0.7, maxOutputTokens: 8192 }
-    })
+    body: JSON.stringify(payload)
   });
   if (!r.ok) throw new Error("gemini " + r.status + ": " + await r.text());
   const d = await r.json();
@@ -417,7 +448,7 @@ async function handleAdminHealth(req, env, pool) {
 
 // ---- Main handler ----
 // 供单元测试使用的具名导出（Cloudflare Worker 运行时只认 default）
-export { PROVIDERS, DEFAULT_MODEL, checkApiKey, corsHeaders };
+export { PROVIDERS, DEFAULT_MODEL, checkApiKey, corsHeaders, toGeminiContents };
 
 export default {
   async fetch(request, env, ctx) {
