@@ -1,208 +1,350 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
   <img src="https://img.shields.io/badge/Cloudflare-Workers-orange" alt="Cloudflare Workers">
-  <img src="https://img.shields.io/badge/models-8-brightgreen" alt="8 Models">
-  <img src="https://img.shields.io/badge/JavaScript-ES2022-yellow" alt="JS">
+  <img src="https://img.shields.io/badge/models-18-brightgreen" alt="18 Models">
+  <img src="https://img.shields.io/badge/providers-6-blueviolet" alt="6 Providers">
+  <img src="https://img.shields.io/badge/tests-82-success" alt="82 Tests">
   <img src="https://img.shields.io/github/stars/ice-wocker/iceProxy?style=social" alt="Stars">
-  <img src="https://img.shields.io/github/forks/ice-wocker/iceProxy?style=social" alt="Forks">
 </p>
 
 <h1 align="center">iceProxy</h1>
 
 <p align="center">
-  <b>OpenAI-compatible API for 8 free AI models in one endpoint</b><br>
-  <sub>Qwen3-Coder-Plus · Qwen3-Coder-Flash · Qwen-Vision · Gemini-2.0-Flash · Gemini-1.5-Flash · GLM-4.5-Flash · Cerebras-Qwen3-32B · OpenRouter-Auto</sub>
+  <b>One OpenAI-compatible endpoint for 18 free AI models across 6 providers</b><br>
+  <sub>Streaming · Cross-provider failover · Multi-account rotation · Zero build step</sub>
 </p>
 
+iceProxy is a Cloudflare Worker that puts 18 free-tier AI models behind a single
+OpenAI-compatible API. Point any OpenAI client at it, change nothing else.
 
-**OpenAI-compatible API for 8 free AI models across 5 providers · Cloudflare Workers · 0 cold start**
-
-iceProxy is a single-file Cloudflare Worker that exposes free-tier AI models as an OpenAI-compatible API. It supports **multi-account rotation** for the Qwen free tier (2000 req/day × N accounts) and **fallback** across providers for high availability.
+**Why it exists:** free tiers are scattered across six different vendors, each with
+its own auth scheme, its own request shape, and its own way of rate-limiting you.
+iceProxy normalizes all of that into `/v1/chat/completions` — and when one provider
+throttles you, it quietly retries on the next one.
 
 ## Features
 
-- ✅ **OpenAI-compatible API** — drop-in replacement for `https://api.openai.com/v1`
-- ✅ **5 free providers** with 8+ models:
-  | Provider | Models | Free Tier | Auth |
-  |----------|--------|-----------|------|
-  | **Qwen** | qwen3-coder-plus, qwen3-coder-flash, vision-model | 2000 req/day | OAuth (QR) |
-  | **Gemini** | gemini-2.0-flash, gemini-1.5-flash | 1500 req/day | API Key |
-  | **GLM** (智谱) | glm-4.5-flash | Generous free | API Key |
-  | **Cerebras** | qwen-3-32b | 30 req/min | API Key |
-  | **OpenRouter** | auto (free models) | Daily free | API Key |
-- ✅ **Multi-account rotation** — add N Qwen accounts, get N × 2000 req/day
-- ✅ **Auto-failover** — when one account is rate-limited, automatically switch to next
-- ✅ **Auto-refresh tokens** — Qwen access tokens refresh on demand
-- ✅ **Daily auto-reset** — failed accounts reset at UTC midnight (no cron)
-- ✅ **Free hosting** — Cloudflare Workers free tier = 100k requests/day
-- ✅ **API key gate** — protect your proxy with your own bearer token
-- ✅ **Admin health endpoint** — monitor all accounts
-- ✅ **Single file** — no build step, just `wrangler deploy`
+- **OpenAI-compatible** — drop-in `base_url` replacement. Works with `openai-python`,
+  LangChain, Cline, Continue, Cursor, `aichat`, `llm`, and anything else that speaks
+  the protocol.
+- **Real streaming** — true SSE passthrough, including Gemini (which doesn't speak
+  OpenAI natively). `stream: true` actually streams.
+- **Cross-provider failover** — a 429 or 5xx on one provider rolls over to the next
+  configured one. Only retryable errors trigger it; a 400 is returned as-is.
+- **Multi-account rotation** — add N Qwen accounts, get N times the quota. Tokens
+  refresh on demand, and a rate-limited account cools down instead of dying.
+- **6 providers, one interface** — Qwen, Gemini, GLM, Cerebras, Groq, OpenRouter.
+- **Zero build step** — plain ES modules, no bundler, no transpiler.
+- **Zero runtime dependencies** — the unit tests use only `node:test`. Nothing to
+  audit in your supply chain.
+- **82 tests** — including regression tests for every bug listed in
+  [Known fixed bugs](#known-fixed-bugs).
+
+## Models
+
+| Model ID | Provider | Context | Notes |
+|---|---|---:|---|
+| `qwen/qwen3-coder-flash` | Qwen | 1M | Default. Fast coding model |
+| `qwen/qwen3-coder-plus` | Qwen | 1M | Stronger coding model |
+| `qwen/qwen3-max` | Qwen | 262K | General flagship |
+| `qwen/qwen-vl-max` | Qwen | 131K | Vision input |
+| `gemini/gemini-2.5-flash` | Gemini | 1M | Vision + audio + tools |
+| `gemini/gemini-2.5-flash-lite` | Gemini | 1M | Cheapest/fastest Gemini |
+| `gemini/gemini-2.0-flash` | Gemini | 1M | Previous gen, still fast |
+| `glm/glm-4.6-flash` | GLM | 200K | Strong Chinese + coding |
+| `glm/glm-4.5-flash` | GLM | 131K | Previous gen |
+| `cerebras/qwen-3-32b` | Cerebras | 131K | Very fast inference |
+| `cerebras/llama-3.3-70b` | Cerebras | 131K | Very fast inference |
+| `groq/llama-3.3-70b-versatile` | Groq | 131K | Very fast inference |
+| `groq/qwen-3-32b` | Groq | 131K | Very fast inference |
+| `openrouter/qwen/qwen3.8-27b:free` | OpenRouter | 262K | Free tier, vision |
+| `openrouter/google/gemma-4-31b-it:free` | OpenRouter | 262K | Free tier, vision |
+| `openrouter/nvidia/nemotron-3-super-120b-a12b:free` | OpenRouter | 262K | Free tier |
+| `openrouter/cohere/north-mini-code:free` | OpenRouter | 256K | Free tier, coding |
+| `openrouter/inclusionai/ling-3.0-flash-sante:free` | OpenRouter | 262K | Free tier, tools |
+
+Only Qwen works with **no API key at all** — it uses OAuth device flow instead.
+That's the default model, so a fresh fork is usable after adding one account.
+
+> Free quotas change constantly, so this README deliberately does **not** list
+> request-per-day numbers. Check each provider's own page. `CI` enforces that this
+> table and `src/providers.js` never drift apart.
 
 ## Architecture
 
 ```
-Client (any OpenAI SDK) ──> iceProxy Worker ──┬─> Qwen OAuth (multi-account)
-                                             ├─> Gemini (Google)
-                                             ├─> GLM (Zhipu)
-                                             ├─> Cerebras
-                                             └─> OpenRouter
+Client (any OpenAI SDK)
+        │
+        ▼
+  ┌─────────────────────────────────────────┐
+  │  iceProxy Worker                        │
+  │                                         │
+  │  worker.js      routing + orchestration │
+  │  providers.js   model catalog (truth)   │
+  │  adapters.js    per-provider protocol   │
+  │  accounts.js    Qwen pool: rotate/refresh│
+  │  openai.js      SSE frames, error shape │
+  └───┬──────┬──────┬──────┬──────┬──────┬──┘
+      │      │      │      │      │      │
+    Qwen  Gemini  GLM  Cerebras  Groq  OpenRouter
+      │
+   KV: account pool (access_token / refresh_token)
 ```
 
-All in one ~450-line `worker.js`.
+`providers.js` is the single source of truth for the model list. `worker.js` reads
+from it. `scripts/check-docs.mjs` asserts the README matches it.
 
-## Quick Start
+## Quick start
 
-### 1. Clone & Install
+### 1. Clone
+
 ```bash
 git clone https://github.com/ice-wocker/iceProxy
 cd iceProxy
 npm install
 ```
 
-### 2. Create KV Namespace
+### 2. Deploy
+
 ```bash
-npx wrangler kv namespace create ACCOUNTS
-# Copy the returned "id" into wrangler.toml
+./deploy.sh
 ```
 
-### 3. (Optional) Set API keys for non-Qwen providers
+That script installs dependencies, runs the tests, creates the KV namespace,
+writes its id back into `wrangler.toml`, and deploys. It's idempotent — running it
+again is safe.
+
+Or do it by hand:
+
 ```bash
-npx wrangler secret put GEMINI_API_KEY       # get free at https://aistudio.google.com/apikey
-npx wrangler secret put GLM_API_KEY          # https://bigmodel.cn/
-npx wrangler secret put CEREBRAS_API_KEY     # https://cloud.cerebras.ai/
-npx wrangler secret put OPENROUTER_API_KEY   # https://openrouter.ai/
-npx wrangler secret put OPENAI_API_KEYS      # "sk-xxx,sk-yyy" - clients must use one of these
-npx wrangler secret put ADMIN_SECRET         # for /admin/health
-```
-
-### 4. (Optional) Add Qwen OAuth accounts
-```bash
-# Add first account - shows QR / device code
-node scripts/auth.js add account1
-
-# Add more accounts to multiply quota
-node scripts/auth.js add account2
-node scripts/auth.js add account3
-
-# List local accounts
-node scripts/auth.js list
-
-# Push to Cloudflare KV
-node scripts/auth.js deploy
-```
-
-### 5. Deploy
-```bash
+npx wrangler kv namespace create ACCOUNTS   # paste the id into wrangler.toml
 npx wrangler deploy
 ```
 
-Your proxy is now live at `https://ice-proxy.<your-subdomain>.workers.dev` 🎉
+### 3. Add a Qwen account (optional, but it's the only key-free path)
+
+```bash
+node scripts/auth.js add
+```
+
+Scan the QR / open the link, and the token lands in Cloudflare KV. Add more
+accounts to multiply the quota.
+
+### 4. Add API keys for the other providers (all optional)
+
+```bash
+npx wrangler secret put GEMINI_API_KEY      # https://aistudio.google.com/apikey
+npx wrangler secret put GLM_API_KEY         # https://bigmodel.cn/
+npx wrangler secret put CEREBRAS_API_KEY    # https://cloud.cerebras.ai/
+npx wrangler secret put GROQ_API_KEY        # https://console.groq.com/keys
+npx wrangler secret put OPENROUTER_API_KEY  # https://openrouter.ai/
+```
+
+Providers without a key are simply marked unavailable in `/v1/models`. They are
+skipped in the failover chain rather than failing at request time.
+
+### 5. Lock it down (do this if it's public)
+
+```bash
+npx wrangler secret put OPENAI_API_KEYS   # "sk-yourkey" — clients must send this
+npx wrangler secret put ADMIN_SECRET      # for /admin/health
+```
+
+Without `OPENAI_API_KEYS` the endpoint is **open** — convenient on `wrangler dev`,
+careless on a public URL.
 
 ## Usage
 
-### cURL
+### curl
+
 ```bash
-# Qwen code (free, 2000/day per account)
-curl -X POST https://ice-proxy.YOUR.workers.dev/v1/chat/completions \
+curl -X POST https://ice-proxy.YOUR-SUBDOMAIN.workers.dev/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer sk-xxx" \
+  -H "Authorization: Bearer sk-yourkey" \
   -d '{
     "model": "qwen/qwen3-coder-flash",
     "messages": [{"role": "user", "content": "Write hello world in Python"}]
   }'
-
-# Gemini (free)
-curl -X POST .../v1/chat/completions \
-  -d '{"model": "gemini/gemini-2.0-flash", "messages": [...]}'
-
-# GLM (free)
-curl -X POST .../v1/chat/completions \
-  -d '{"model": "glm/glm-4.5-flash", "messages": [...]}'
 ```
 
-### Python (OpenAI SDK)
+Streaming:
+
+```bash
+curl -N -X POST .../v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "glm/glm-4.6-flash", "stream": true,
+       "messages": [{"role": "user", "content": "hi"}]}'
+```
+
+### Python (official SDK)
+
 ```python
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="https://ice-proxy.YOUR.workers.dev/v1",
-    api_key="sk-xxx"  # the OPENAI_API_KEYS you set
+    base_url="https://ice-proxy.YOUR-SUBDOMAIN.workers.dev/v1",
+    api_key="sk-yourkey",
 )
 
-response = client.chat.completions.create(
-    model="qwen/qwen3-coder-flash",
-    messages=[{"role": "user", "content": "Explain recursion"}]
+# non-streaming
+r = client.chat.completions.create(
+    model="gemini/gemini-2.5-flash",
+    messages=[{"role": "user", "content": "Explain recursion"}],
 )
-print(response.choices[0].message.content)
+print(r.choices[0].message.content)
+
+# streaming
+with client.chat.completions.create(
+    model="qwen/qwen3-coder-flash",
+    messages=[{"role": "user", "content": "Write a haiku"}],
+    stream=True,
+) as stream:
+    for chunk in stream:
+        if chunk.choices[0].delta.content:
+            print(chunk.choices[0].delta.content, end="")
 ```
 
 ### Node.js
+
 ```js
 import OpenAI from "openai";
+
 const client = new OpenAI({
-  baseURL: "https://ice-proxy.YOUR.workers.dev/v1",
-  apiKey: process.env.ICE_PROXY_KEY
+  baseURL: "https://ice-proxy.YOUR-SUBDOMAIN.workers.dev/v1",
+  apiKey: process.env.ICE_PROXY_KEY,
 });
-const r = await client.chat.completions.create({
-  model: "gemini/gemini-2.0-flash",
-  messages: [{ role: "user", content: "Hello" }]
+
+const stream = await client.chat.completions.create({
+  model: "groq/llama-3.3-70b-versatile",
+  messages: [{ role: "user", content: "Hello" }],
+  stream: true,
 });
+for await (const chunk of stream) {
+  process.stdout.write(chunk.choices[0]?.delta?.content ?? "");
+}
 ```
 
-### Cline / Continue.dev / Cursor / etc.
-Set:
-- **API Base URL**: `https://ice-proxy.YOUR.workers.dev/v1`
+### Cline / Continue / Cursor
+
+- **Base URL**: `https://ice-proxy.YOUR-SUBDOMAIN.workers.dev/v1`
 - **API Key**: your `OPENAI_API_KEYS` value
-- **Model**: any of the 8 listed (e.g. `qwen/qwen3-coder-flash`)
-
-## Models
-
-| Model ID | Provider | Best For | Notes |
-|----------|----------|----------|-------|
-| `qwen/qwen3-coder-plus` | Qwen | Coding | 2000/day per account |
-| `qwen/qwen3-coder-flash` | Qwen | Coding, fast | 2000/day, lower latency |
-| `qwen/vision-model` | Qwen | Image input | 2000/day |
-| `gemini/gemini-2.0-flash` | Google | Multimodal, fast | 1500/day |
-| `gemini/gemini-1.5-flash` | Google | Multimodal | 1500/day |
-| `glm/glm-4.5-flash` | Zhipu | Chinese | Generous free |
-| `cerebras/qwen-3-32b` | Cerebras | Fast Qwen 32B | 30 req/min |
-| `openrouter/auto` | OpenRouter | Many free models | Daily free |
+- **Model**: any id from the table above
 
 ## Endpoints
 
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Liveness check |
-| `/v1/models` | GET | List models (OpenAI compat) |
-| `/v1/chat/completions` | POST | Chat completion |
-| `/v1/auth/start` | POST | Start Qwen OAuth (returns user code) |
-| `/v1/auth/poll` | POST | Poll Qwen OAuth (with code_verifier) |
-| `/admin/health` | GET | Account health (requires ADMIN_SECRET) |
+| Endpoint | Method | Auth | Description |
+|---|---|---|---|
+| `/health` | GET | none | Liveness + which providers are configured |
+| `/v1/models` | GET | optional | List models, with `context_length`, `capabilities`, `available` |
+| `/v1/chat/completions` | POST | optional | Chat completion (streaming and non-streaming) |
+| `/v1/auth/start` | POST | optional | Begin Qwen OAuth device flow |
+| `/v1/auth/poll` | POST | optional | Poll for the Qwen token and store the account |
+| `/admin/health` | GET | `ADMIN_SECRET` | Account pool status |
 
-## Multi-Account Logic
+`/v1/models` adds three non-standard fields (`context_length`, `capabilities`,
+`available`). Standard clients ignore them; clients that care about context window
+can use them.
 
-When you add multiple Qwen accounts, iceProxy automatically:
+## Behavior worth knowing
 
-1. **Picks freshest token** — favors accounts whose access_token is far from expiry
-2. **Auto-refreshes** — refreshes access_token using refresh_token when needed
-3. **Auto-failover** — on 429 (rate limit) or 401 (invalid), instantly switches to next account
-4. **Daily reset** — failed accounts are tried again at UTC midnight (no cron job needed)
-5. **Persistent** — tokens cached in Cloudflare KV, survive deploys
+### Failover
 
-With 5 Qwen accounts you get **10,000 req/day** for free.
+The candidate chain is built as:
+
+1. the model you asked for,
+2. other models from the same provider (same credential, cheapest to try),
+3. models from other providers that have credentials configured.
+
+Capped at 4 attempts. Only **429, 401, 403 and 5xx** advance the chain — a 400 means
+the request itself is wrong, and retrying it elsewhere would just burn another
+provider's quota to produce the same error.
+
+When the request is served by a different model than you asked for, the response
+carries `_proxy` and the header `X-IceProxy-Fallback`:
+
+```json
+{
+  "_proxy": {
+    "servedModel": "glm/glm-4.6-flash→groq/llama-3.3-70b-versatile",
+    "fellBack": true,
+    "attempts": [{ "model": "glm/glm-4.6-flash", "error": "HTTP 429: ..." }]
+  }
+}
+```
+
+### Account rotation
+
+For Qwen, `iceProxy`:
+
+- picks the account whose token expires latest,
+- refreshes proactively 2 minutes before expiry (so a token can't expire mid-request),
+- deduplicates concurrent refreshes within an isolate (KV has no atomic ops),
+- cools down on failure **by cause**: rate limits for a minute, server errors for
+  seconds, auth failures for hours. It does not burn an account for the whole day
+  over one 429.
+
+Failed accounts recover automatically — there's no cron job.
+
+### Statelessness
+
+The worker keeps no conversation state. Context is whatever the client resends each
+turn, which is how OpenAI behaves. Streaming requests are proxied, not buffered.
 
 ## Cost
 
-- **Cloudflare Workers free tier**: 100,000 requests/day
-- **KV free tier**: 100,000 reads/day, 1,000 writes/day
-- **Total**: $0/month for personal use
+Cloudflare Workers and KV both have free tiers that comfortably cover personal use.
+Total: $0/month. See Cloudflare's current pricing for limits.
+
+## Development
+
+```bash
+npm test                        # 82 tests, no network, no dependencies
+node scripts/check-docs.mjs     # README vs code consistency
+npm run check                   # both
+```
+
+The tests mock `globalThis.fetch`, so they run offline and never touch a real
+provider. They cover: SSE frame reassembly across arbitrary chunk boundaries,
+streaming and non-streaming for every protocol, the failover chain, account pool
+rotation/refresh/cooldown, and every historical bug below.
+
+## Known fixed bugs
+
+These are documented because each one is now covered by a regression test — and
+because they're the class of bug that a green test suite would happily miss.
+
+| Bug | Symptom | Root cause |
+|---|---|---|
+| Streaming never streamed | `stream: true` returned a single JSON blob; chat UIs hung | `stream` was hardcoded to `false` in the OpenAI-compat path |
+| Gemini had no streaming at all | Same, for all Gemini models | Only `generateContent` was implemented, never `streamGenerateContent` |
+| Valid Qwen accounts rejected | "no Qwen account available" with a fresh token | Account pool read `acc.token`, but accounts store `access_token` — so every request took the refresh path, and one failed refresh blacklisted the account for the day |
+| Same bug, second effect | An extra token-refresh round trip on every request | Same field-name mismatch |
+| README lied about failover | Documented "cross-provider failover" that didn't exist | Only Qwen *account* rotation was implemented |
+| Errors broke SDKs | `KeyError` inside client libraries | Error body was `{"error": "string"}` instead of `{"error": {"message": ...}}` |
+| Gemini dropped conversation history | Model forgot everything each turn with Cline/Cursor | Only the last message was forwarded |
+| Last chunk of a broken stream vanished | Response truncated mid-sentence | Buffered SSE rows were discarded when the upstream errored |
+| Docs drift | README said 7 models, code had 8, `package.json` said 5 | No single source of truth; now `providers.js` + a CI check |
+
+## Limitations
+
+- **This is a proxy, not a service.** It depends on free tiers that vendors can
+  change, rate-limit, or withdraw at any time. No availability guarantee.
+- **Automating OAuth account creation may violate a vendor's terms.** `scripts/auth.js`
+  is a convenience for your own account. Use it on accounts you own.
+- **Free quotas are shared and finite.** Don't hammer it. Excessive use gets your
+  own accounts throttled or banned.
+- **`_proxy` is non-standard.** Some strict clients may reject unknown top-level
+  response fields. The streaming path never adds it.
+- **Tool calling is passed through, not normalized.** Providers differ in how they
+  express tool calls; iceProxy forwards `tools`/`tool_choice` but doesn't translate
+  between dialects.
+- **No embeddings or moderation endpoints.** Inference only.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
 
-## ⭐ Star History
+## Star history
 
 <a href="https://star-history.com/#ice-wocker/iceProxy&Timeline">
   <picture>

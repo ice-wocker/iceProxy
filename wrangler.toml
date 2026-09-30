@@ -1,23 +1,30 @@
 name = "ice-proxy"
 main = "src/worker.js"
-compatibility_date = "2024-09-23"
+compatibility_date = "2025-01-01"
 
-# 1. Create KV namespace:
-#    npx wrangler kv namespace create ACCOUNTS
-# 2. Paste the returned id below:
-# [[kv_namespaces]]
-# binding = "ACCOUNTS"
-# id = "your_kv_id"
-
-# 3. Set secrets (one of these patterns):
-#    npx wrangler secret put OPENAI_API_KEYS     -- "sk-xxx,sk-yyy"
-#    npx wrangler secret put ADMIN_SECRET        -- "your-admin-secret"
-#    npx wrangler secret put GEMINI_API_KEY      -- "AIzaSy..."
-#    npx wrangler secret put GLM_API_KEY         -- "glm-xxx.bigmodel.cn"
-#    npx wrangler secret put CEREBRAS_API_KEY    -- "csk-xxx"
-#    npx wrangler secret put OPENROUTER_API_KEY  -- "sk-or-xxx"
+# ── KV：存 Qwen OAuth 账号 ─────────────────────────────────
+# 创建： npx wrangler kv namespace create ACCOUNTS
+# 把返回的 id 填进下面（用 `npm run setup` 会自动填，不用手改这个文件）
 #
-#    (if any of these are unset, that provider's models will be unavailable)
+# 不配 KV 也能部署，只是 Qwen 那几个模型不可用（它们需要账号池），
+# 其它用静态密钥的 provider 不受影响。
+[[kv_namespaces]]
+binding = "ACCOUNTS"
+id = "REPLACE_WITH_KV_ID"
 
 [vars]
-DEFAULT_MODEL = "qwen/qwen3-coder-flash"
+# 默认模型。留空则用 src/providers.js 里的 DEFAULT_MODEL。
+# 想换默认模型改这里，不用改代码（也不用重新部署代码，改 vars 即可）。
+DEFAULT_MODEL = ""
+
+# ── 密钥（用 wrangler secret put 设置，别写在这个文件里）──────
+#   npx wrangler secret put OPENAI_API_KEYS     # 保护你的代理，如 "sk-a,sk-b"
+#   npx wrangler secret put ADMIN_SECRET        # /admin/health 的口令
+#   npx wrangler secret put GEMINI_API_KEY      # https://aistudio.google.com/apikey
+#   npx wrangler secret put GLM_API_KEY         # https://bigmodel.cn/
+#   npx wrangler secret put CEREBRAS_API_KEY    # https://cloud.cerebras.ai/
+#   npx wrangler secret put GROQ_API_KEY        # https://console.groq.com/keys
+#   npx wrangler secret put OPENROUTER_API_KEY  # https://openrouter.ai/
+#
+# 一个都没配也能跑 —— 用 `node scripts/auth.js add` 加 Qwen 账号即可，
+# 那条链路不需要任何静态密钥。

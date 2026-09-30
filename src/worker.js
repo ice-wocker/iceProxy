@@ -1,72 +1,466 @@
 /**
- * iceProxy - OpenAI-compatible API for 5 free AI models
- * 
- * Models:
- *   - qwen/qwen3-coder-plus       (Qwen code, 2000 req/day, OAuth)
- *   - qwen/qwen3-coder-flash      (Qwen code fast)
- *   - qwen/vision-model           (Qwen vision)
- *   - gemini/gemini-2.0-flash     (Google free)
- *   - gemini/gemini-1.5-flash     (Google free)
- *   - glm/glm-4.5-flash           (Zhipu BigModel free)
- *   - cerebras/qwen-3-32b         (Cerebras mirror free)
- *   - openrouter/*                (OpenRouter free models)
+ * iceProxy —— 把多家免费 AI 模型聚合成一个 OpenAI 兼容端点。
  *
- * Deploy: npx wrangler deploy
- * Auth:   node scripts/auth.js add
- * Secrets:
- *   OPENAI_API_KEYS  (comma-sep) - who can call your proxy
- *   ADMIN_SECRET     (optional)  - for /admin/health
- *   KV namespace ice_proxy (free 100k keys)
+ * 架构：
+ *   worker.js      路由与编排（本文件）
+ *   providers.js   模型目录 + provider 注册表（单一真相源）
+ *   accounts.js    Qwen OAuth 账号池（轮换 / 刷新 / 冷却）
+ *   adapters.js    各家协议适配（含 Gemini 的翻译）
+ *   openai.js      OpenAI 协议形状（SSE 帧、错误体）
+ *
+ * 部署：npx wrangler deploy
+ * 密钥：见 README 的「密钥」一节
  */
 
-const DEFAULT_MODEL = "qwen/qwen3-coder-flash";
+import {
+  PROVIDERS,
+  MODELS,
+  DEFAULT_MODEL,
+  buildCatalog
+} from "./providers.js";
+import {
+  AccountPool,
+  AuthFailure
+} from "./accounts.js";
+import {
+  toGeminiPayload,
+  fromGeminiResponse,
+  iterGeminiDeltas,
+  iterOpenAiDeltas,
+  resolveApiKey,
+  classifyStatus
+} from "./adapters.js";
+import {
+  corsHeaders,
+  errorResponse,
+  upstreamError,
+  ok,
+  completionId,
+  sseChunk,
+  sseDone,
+  streamResponse,
+  iterSsePayloads
+} from "./openai.js";
+import { QWEN_DEVICE_CODE_URL, QWEN_TOKEN_URL, QWEN_CLIENT_ID } from "./accounts.js";
 
-// ---- Provider Config ----
-const PROVIDERS = {
-  "qwen/qwen3-coder-plus": {
-    type: "qwen-oauth",
-    base: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    oauth: "https://chat.qwen.ai"
-  },
-  "qwen/qwen3-coder-flash": {
-    type: "qwen-oauth",
-    base: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    oauth: "https://chat.qwen.ai"
-  },
-  "qwen/vision-model": {
-    type: "qwen-oauth",
-    base: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    oauth: "https://chat.qwen.ai"
-  },
-  "gemini/gemini-2.0-flash": {
-    type: "gemini-key",
-    base: "https://generativelanguage.googleapis.com/v1beta"
-  },
-  "gemini/gemini-1.5-flash": {
-    type: "gemini-key",
-    base: "https://generativelanguage.googleapis.com/v1beta"
-  },
-  "glm/glm-4.5-flash": {
-    type: "openai-key",
-    base: "https://open.bigmodel.cn/api/paas/v4"
-  },
-  "cerebras/qwen-3-32b": {
-    type: "openai-key",
-    base: "https://api.cerebras.ai/v1"
-  },
-  "openrouter/auto": {
-    type: "openai-key",
-    base: "https://openrouter.ai/api/v1"
+const catalog = buildCatalog();
+
+// ---------- 鉴权 ----------
+
+/**
+ * 校验客户端 API key。
+ *
+ * 未配置 OPENAI_API_KEYS 时放行：本地 `wrangler dev` 和自用场景不需要，
+ * 强迫配置只会让人多一道坎。
+ */
+export function checkApiKey(request, env) {
+  const configured = env?.OPENAI_API_KEYS;
+  if (!configured) return true;
+  const allowed = String(configured)
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (!allowed.length) return true;
+  const auth = request.headers.get("Authorization") || "";
+  const m = auth.match(/^Bearer\s+(.+)$/i);
+  if (!m) return false;
+  // 常量时间比较，避免通过响应时间逐字节猜 key
+  return allowed.some((k) => timingSafeEqual(k, m[1]));
+}
+
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+// ---------- 路由处理 ----------
+
+function handleHealth(env) {
+  const configured = new Set();
+  for (const p of Object.values(PROVIDERS)) {
+    if (p.auth === "key" && env?.[p.keyEnv]) configured.add(p.keyEnv);
   }
-};
+  return ok({
+    status: "ok",
+    service: "iceProxy",
+    models: MODELS.length,
+    // 只报「哪些密钥已配置」，不回显值
+    providers_ready: [...configured],
+    qwen_pool: !!env?.ACCOUNTS
+  });
+}
 
-// ---- Qwen OAuth helpers ----
-const QWEN_OAUTH = {
-  deviceCodeUrl: "https://chat.qwen.ai/api/v1/oauth2/device/code",
-  tokenUrl: "https://chat.qwen.ai/api/v1/oauth2/token",
-  clientId: "f0304373b74a44d2b584a3fb70ca9e56",
-  scope: "openid profile email model.completion"
-};
+/**
+ * /v1/models —— 返回 OpenAI 形状的模型列表。
+ *
+ * 比官方多两个非标准字段（context_length / capabilities / provider），
+ * 标准客户端会忽略它们，而需要判断上下文的客户端能用上。
+ */
+async function handleModels(env, pool) {
+  let accountCount = 0;
+  if (pool?.enabled) {
+    try {
+      accountCount = (await pool.list()).length;
+    } catch {
+      accountCount = 0;
+    }
+  }
+  const data = MODELS.map((m) => {
+    const entry = catalog.get(m.id);
+    const ready = isProviderReady(entry.provider, env, accountCount);
+    return {
+      id: m.id,
+      object: "model",
+      created: 0,
+      owned_by: entry.prefix,
+      provider: entry.provider.label,
+      context_length: entry.ctx,
+      capabilities: entry.caps,
+      // 非标准但很有用：告诉客户端这个模型此刻能不能用
+      available: ready
+    };
+  });
+  return ok({ object: "list", data });
+}
+
+function isProviderReady(provider, env, accountCount) {
+  if (provider.auth === "qwen-oauth") return accountCount > 0;
+  return !!resolveApiKey(provider, env);
+}
+
+// ---------- 单次上游调用 ----------
+
+/**
+ * 发起一次上游请求，返回原始 Response。
+ *
+ * 这里**不再改写 stream 字段** —— 客户端要流式就传流式，要非流式就传非流式。
+ * 上一版在 openai-compat 分支硬编码 `stream: false`，是「流式请求收到
+ * 非流式响应」这个 bug 的根因。
+ */
+async function callUpstream({ entry, body, env, pool, stream }) {
+  const { provider, upstreamModel } = entry;
+
+  if (provider.auth === "qwen-oauth") {
+    const acc = await pool.pick();
+    if (!acc) throw new AuthFailure("no_qwen_account");
+    let account = acc.acc;
+    let accountId = acc.id;
+    if (acc.needsRefresh) {
+      try {
+        account = await pool.refresh(acc.id, acc.acc);
+      } catch (e) {
+        await pool.penalize(acc.id, acc.acc, e instanceof AuthFailure ? "auth_failure" : "network");
+        throw e;
+      }
+    }
+    const upstream = { ...body, model: upstreamModel, stream };
+    const resp = await fetch(`${provider.base}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${account.access_token}`
+      },
+      body: JSON.stringify(upstream)
+    });
+    return { resp, accountId, account };
+  }
+
+  if (provider.protocol === "gemini") {
+    const key = resolveApiKey(provider, env);
+    if (!key) throw new AuthFailure(`missing_key:${provider.keyEnv}`);
+    const payload = toGeminiPayload(body);
+    const method = stream ? "streamGenerateContent" : "generateContent";
+    const suffix = stream ? "&alt=sse" : "";
+    const resp = await fetch(
+      `${provider.base}/models/${upstreamModel}:${method}?key=${encodeURIComponent(key)}${suffix}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      }
+    );
+    return { resp, gemini: true };
+  }
+
+  // openai 兼容：GLM / Cerebras / Groq / OpenRouter
+  const key = resolveApiKey(provider, env);
+  if (!key) throw new AuthFailure(`missing_key:${provider.keyEnv}`);
+  const upstream = { ...body, model: upstreamModel, stream };
+  delete upstream.provider;
+  const resp = await fetch(`${provider.base}/chat/completions`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${key}`,
+      ...(provider.extraHeaders || {})
+    },
+    body: JSON.stringify(upstream)
+  });
+  return { resp };
+}
+
+/** 从请求体里挑出该转发给上游的字段，避免把客户端私有字段透传过去。 */
+export function buildUpstreamBody(body) {
+  const out = {};
+  const pass = [
+    "messages",
+    "temperature",
+    "top_p",
+    "max_tokens",
+    "max_completion_tokens",
+    "stop",
+    "presence_penalty",
+    "frequency_penalty",
+    "seed",
+    "response_format",
+    "tools",
+    "tool_choice",
+    "parallel_tool_calls",
+    "reasoning_effort",
+    "user"
+  ];
+  for (const k of pass) if (body[k] !== undefined) out[k] = body[k];
+  // 只保留 user/assistant/system/tool 角色，且 content 必须是字符串或数组
+  out.messages = (Array.isArray(body.messages) ? body.messages : [])
+    .filter((m) => m && typeof m === "object" && m.role)
+    .map((m) => ({ ...m, content: m.content ?? "" }));
+  return out;
+}
+
+// ---------- 候选链（跨 provider 回退）----------
+
+/**
+ * 决定这次请求可以依次尝试哪些 provider。
+ *
+ * 上一版 README 写着「自动跨 provider 故障转移」，但代码里
+ * 只有 Qwen 的**账号**轮换，没有任何跨 provider 回退 —— 文档在说谎。
+ *
+ * 现在的规则：
+ *   1. 首选客户端指定的模型；
+ *   2. 然后是同 provider 的其他模型（同密钥，最省事）；
+ *   3. 最后是其它「已配置好密钥」的 provider 的默认模型。
+ * 只有在上游返回可重试错误时才往下走，客户端参数错误（400）不重试。
+ */
+export function buildFallbackChain(modelId, env, accountCount) {
+  const primary = catalog.get(modelId);
+  if (!primary) return [];
+  // 主模型自身也要检查凭据：否则「没配任何密钥」会得到一个非空候选链，
+  // 一路试到最后一个 provider 才报错，错误信息也说不清到底缺什么。
+  const chain = isProviderReady(primary.provider, env, accountCount) ? [primary] : [];
+  const seen = new Set([modelId]);
+
+  for (const m of MODELS) {
+    const e = catalog.get(m.id);
+    if (seen.has(m.id)) continue;
+    if (e.prefix === primary.prefix && isProviderReady(e.provider, env, accountCount)) {
+      seen.add(m.id);
+      chain.push(e);
+    }
+  }
+  for (const m of MODELS) {
+    const e = catalog.get(m.id);
+    if (seen.has(m.id)) continue;
+    if (e.prefix !== primary.prefix && isProviderReady(e.provider, env, accountCount)) {
+      seen.add(m.id);
+      chain.push(e);
+    }
+  }
+  return chain.slice(0, 4); // 别无限重试，用户等不起
+}
+
+/** 这个状态码值得换个 provider 再试吗？ */
+function isRetryable(status) {
+  return status === 429 || status === 401 || status === 403 || status >= 500;
+}
+
+// ---------- 主处理 ----------
+
+async function handleChat(rawBody, env, pool, wantStream) {
+  const body = buildUpstreamBody(rawBody);
+  const requested = rawBody.model || DEFAULT_MODEL;
+
+  if (!catalog.has(requested)) {
+    const available = MODELS.map((m) => m.id).join(", ");
+    return errorResponse(
+      `unknown model: ${requested}. Available models: ${available}`,
+      { type: "invalid_request_error", code: "model_not_found", param: "model" }
+    );
+  }
+  if (!body.messages.length) {
+    return errorResponse("messages 不能为空", { param: "messages" });
+  }
+
+  let accountCount = 0;
+  if (pool?.enabled) {
+    try {
+      accountCount = (await pool.list()).length;
+    } catch {
+      accountCount = 0;
+    }
+  }
+
+  const chain = buildFallbackChain(requested, env, accountCount);
+  if (!chain.length) {
+    return errorResponse(
+      `没有可用于 ${requested} 的凭据。请配置对应的密钥，或用 /v1/auth/start 添加 Qwen 账号。`,
+      { status: 400, type: "invalid_request_error", code: "no_credentials" }
+    );
+  }
+
+  const attempts = [];
+  for (const entry of chain) {
+    let out;
+    try {
+      out = await callUpstream({ entry, body, env, pool, stream: wantStream });
+    } catch (e) {
+      if (e instanceof AuthFailure && e.message.startsWith("missing_key:")) {
+        attempts.push({ model: entry.id, error: `缺少密钥 ${e.message.split(":")[1]}` });
+        continue;
+      }
+      if (e instanceof AuthFailure && e.message === "no_qwen_account") {
+        attempts.push({ model: entry.id, error: "没有可用的 Qwen 账号" });
+        continue;
+      }
+      attempts.push({ model: entry.id, error: e.message });
+      continue;
+    }
+
+    const { resp } = out;
+    if (!resp.ok) {
+      const reason = classifyStatus(resp.status);
+      if (out.accountId && pool) {
+        await pool.penalize(out.accountId, out.account, reason);
+      }
+      const text = await resp.text().catch(() => "");
+      attempts.push({ model: entry.id, error: `HTTP ${resp.status}: ${text.slice(0, 300)}` });
+      // 只有可重试的错误才继续往下试；400 说明是请求本身的问题，换个 provider 也一样
+      if (!isRetryable(resp.status)) {
+        return upstreamError(
+          `上游拒绝请求（${entry.id}）：${text.slice(0, 500)}`,
+          resp.status >= 400 && resp.status < 500 ? 400 : 502
+        );
+      }
+      continue;
+    }
+
+    // 成功：请求的模型和实际用的不一致时，在响应里标出来（非标准字段，但有用）
+    const servedModel = entry.id === requested ? entry.id : `${requested}→${entry.id}`;
+    const meta = { servedModel, fellBack: entry.id !== requested, attempts };
+
+    if (wantStream) {
+      return makeStreamResponse({ entry, resp, model: requested, meta });
+    }
+    return makeJsonResponse({ entry, resp, model: requested, meta });
+  }
+
+  const detail = attempts.map((a) => `${a.model}: ${a.error}`).join(" | ");
+  return upstreamError(`所有候选 provider 都失败了。${detail}`);
+}
+
+async function makeJsonResponse({ entry, resp, model, meta }) {
+  const id = completionId();
+  const created = Math.floor(Date.now() / 1000);
+
+  // Gemini 需要翻译形状，OpenAI 兼容的直接透传
+  if (entry.provider.protocol === "gemini") {
+    const d = await resp.json().catch(() => null);
+    if (!d) return upstreamError("上游返回了非 JSON 内容");
+    if (d.error) return upstreamError(d.error.message || JSON.stringify(d.error), 502);
+    const { text, usage, finishReason } = fromGeminiResponse(d, model);
+    return ok({
+      ...requireOpenaiShape({ id, created, model, content: text, usage, finishReason }),
+      _proxy: meta
+    });
+  }
+
+  const d = await resp.json().catch(() => null);
+  if (!d) return upstreamError("上游返回了非 JSON 内容");
+  if (d.error) return upstreamError(d.error.message || JSON.stringify(d.error), 502);
+  // 上游的 usage/model 保持原样，只补上缺失的字段
+  return ok({
+    id: d.id || id,
+    object: "chat.completion",
+    created: d.created || created,
+    model: d.model || model,
+    choices: (d.choices || []).map((c, i) => ({
+      index: c.index ?? i,
+      message: {
+        role: "assistant",
+        content: c.message?.content ?? "",
+        ...(c.message?.reasoning_content ? { reasoning_content: c.message.reasoning_content } : {}),
+        ...(c.message?.tool_calls ? { tool_calls: c.message.tool_calls } : {})
+      },
+      finish_reason: c.finish_reason ?? "stop"
+    })),
+    usage: d.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+    _proxy: meta
+  });
+}
+
+function requireOpenaiShape({ id, created, model, content, usage, finishReason }) {
+  return {
+    id,
+    object: "chat.completion",
+    created,
+    model,
+    choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: finishReason }],
+    usage: usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+  };
+}
+
+/** 流式：把上游的流实时转成 OpenAI 的 SSE。 */
+async function makeStreamResponse({ entry, resp, model, meta }) {
+  const id = completionId();
+  const created = Math.floor(Date.now() / 1000);
+  const isGemini = entry.provider.protocol === "gemini";
+  const upstreamBody = resp.body;
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const enc = new TextEncoder();
+      const send = (s) => controller.enqueue(enc.encode(s));
+      let emittedUsage = null;
+      let finishReason = "stop";
+      try {
+        // 首帧先声明助手角色，官方 SDK 依赖这一帧建立 message 对象
+        send(sseChunk({ id, created, model, delta: { role: "assistant", content: "" } }));
+
+        const source = isGemini ? iterGeminiDeltas(upstreamBody) : iterOpenAiDeltas(upstreamBody);
+        for await (const ev of source) {
+          if (ev.usage) emittedUsage = ev.usage;
+          if (ev.text) {
+            send(sseChunk({ id, created, model, delta: { content: ev.text } }));
+          }
+          if (ev.reasoning) {
+            send(sseChunk({ id, created, model, delta: { reasoning_content: ev.reasoning } }));
+          }
+          if (ev.finish) {
+            finishReason = ev.finish === "MAX_TOKENS" ? "length" : ev.finish;
+          }
+        }
+        // 末帧带上 finish_reason 和 usage（有的话）
+        const last = { choices: [{ index: 0, delta: {}, finish_reason: finishReason }] };
+        if (emittedUsage) last.usage = emittedUsage;
+        send(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, ...last })}\n\n`);
+        send(sseDone());
+      } catch (e) {
+        // 已经发出 200 头了，只能把错误塞进流里
+        send(`data: ${JSON.stringify({ error: { message: String(e?.message || e), type: "upstream_error" } })}\n\n`);
+        send(sseDone());
+      } finally {
+        controller.close();
+      }
+    }
+  });
+
+  const headers = {};
+  if (meta.fellBack) headers["X-IceProxy-Fallback"] = meta.servedModel;
+  return streamResponse(stream);
+}
+
+// ---------- Qwen OAuth 设备流 ----------
 
 function b64url(bytes) {
   let s = btoa(String.fromCharCode(...bytes));
@@ -78,417 +472,172 @@ async function sha256(s) {
   return new Uint8Array(buf);
 }
 
-async function startQwenAuth() {
+export async function startQwenAuth() {
   const verifier = b64url(crypto.getRandomValues(new Uint8Array(64)));
   const challenge = b64url(await sha256(verifier));
   const body = new URLSearchParams({
-    client_id: QWEN_OAUTH.clientId,
-    scope: QWEN_OAUTH.scope,
+    client_id: QWEN_CLIENT_ID,
+    scope: "openid profile email model.completion",
     code_challenge: challenge,
     code_challenge_method: "S256"
   });
-  const r = await fetch(QWEN_OAUTH.deviceCodeUrl, {
+  const r = await fetch(QWEN_DEVICE_CODE_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body
   });
-  if (!r.ok) throw new Error("auth init failed: " + r.status);
+  if (!r.ok) throw new Error(`auth init failed: ${r.status} ${await r.text()}`);
   const d = await r.json();
   return { ...d, code_verifier: verifier };
 }
 
-async function pollQwenToken(deviceCode, verifier) {
+export async function pollQwenToken(deviceCode, verifier) {
   const body = new URLSearchParams({
     grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-    client_id: QWEN_OAUTH.clientId,
+    client_id: QWEN_CLIENT_ID,
     device_code: deviceCode,
     code_verifier: verifier
   });
-  const r = await fetch(QWEN_OAUTH.tokenUrl, {
+  const r = await fetch(QWEN_TOKEN_URL, {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
     body
   });
-  return { status: r.status, data: await r.json() };
+  return { status: r.status, data: await r.json().catch(() => ({})) };
 }
 
-// ---- Multi-account manager ----
-class AccountPool {
-  constructor(env) {
-    this.env = env;
-    this.failedToday = new Set();
-  }
-  
-  // List all account ids stored in KV
-  async listAccounts() {
-    const list = await this.env.ACCOUNTS.list({ prefix: "acc:" });
-    return list.keys.map(k => k.name.replace(/^acc:/, ""));
-  }
-  
-  // Get a specific account
-  async getAccount(id) {
-    const raw = await this.env.ACCOUNTS.get("acc:" + id);
-    if (!raw) return null;
-    try { return JSON.parse(raw); } catch { return null; }
-  }
-  
-  // Save account
-  async saveAccount(id, data) {
-    await this.env.ACCOUNTS.put("acc:" + id, JSON.stringify(data));
-  }
-  
-  async deleteAccount(id) {
-    await this.env.ACCOUNTS.delete("acc:" + id);
-  }
-  
-  // Pick best account for a model type
-  async pickAccount(providerType) {
-    const today = new Date().toISOString().slice(0, 10);
-    // Reset failed list if new day
-    if (this._lastReset !== today) {
-      this._lastReset = today;
-      this.failedToday = new Set();
-    }
-    
-    const ids = await this.listAccounts();
-    const candidates = [];
-    for (const id of ids) {
-      if (this.failedToday.has(id)) continue;
-      const acc = await this.getAccount(id);
-      if (!acc) continue;
-      // Check token expiry
-      if (acc.token && acc.expires_at && Date.now() / 1000 < acc.expires_at - 60) {
-        candidates.push({ id, acc, score: acc.expires_at });
-      } else if (acc.refresh_token) {
-        // Try to refresh
-        try {
-          const newAcc = await this.refreshToken(acc);
-          await this.saveAccount(id, newAcc);
-          candidates.push({ id, acc: newAcc, score: newAcc.expires_at });
-        } catch (e) {
-          this.failedToday.add(id);
-        }
-      } else {
-        this.failedToday.add(id);
-      }
-    }
-    if (candidates.length === 0) return null;
-    // Pick the freshest
-    candidates.sort((a, b) => b.score - a.score);
-    return candidates[0];
-  }
-  
-  markFailed(id) {
-    this.failedToday.add(id);
-  }
-  
-  async refreshToken(acc) {
-    const body = new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: acc.refresh_token,
-      client_id: QWEN_OAUTH.clientId
-    });
-    const r = await fetch(QWEN_OAUTH.tokenUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body
-    });
-    if (!r.ok) throw new Error("refresh failed: " + r.status);
-    const d = await r.json();
-    return {
-      ...acc,
-      access_token: d.access_token,
-      refresh_token: d.refresh_token || acc.refresh_token,
-      expires_at: Math.floor(Date.now() / 1000) + (d.expires_in || 3600)
-    };
-  }
-}
+// ---------- 导出（供测试使用；Worker 运行时只认 default）----------
 
-// ---- Auth gate ----
-function checkApiKey(req, env) {
-  if (!env.OPENAI_API_KEYS) return true; // open mode
-  const allowed = env.OPENAI_API_KEYS.split(",").map(s => s.trim()).filter(Boolean);
-  if (allowed.length === 0) return true;
-  const auth = req.headers.get("Authorization") || "";
-  const m = auth.match(/^Bearer\s+(.+)$/);
-  if (!m) return false;
-  return allowed.includes(m[1]);
-}
-
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type,Authorization"
-  };
-}
-
-// ---- Provider calls ----
-async function callQwenOAuth(req, env, pool) {
-  const acc = await pool.pickAccount("qwen");
-  if (!acc) {
-    throw new Error("no Qwen account available. Add one via /v1/auth/start");
-  }
-  const modelId = req.model.replace(/^qwen\//, "");
-  const upstream = {
-    ...req,
-    model: modelId,
-    stream: !!req.stream
-  };
-  const r = await fetch("https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer " + acc.acc.access_token
-    },
-    body: JSON.stringify(upstream)
-  });
-  if (!r.ok) {
-    const text = await r.text();
-    if (r.status === 429 || r.status === 401) {
-      pool.markFailed(acc.id);
-    }
-    throw new Error("qwen upstream " + r.status + ": " + text);
-  }
-  return r;
-}
-
-/**
- * 把 OpenAI 格式的 messages 转成 Gemini 的 contents。
- *
- * <p>此前的实现只取 messages 的最后一条——多轮对话的历史被整段丢弃，
- * 而 Cline / Cursor 这类客户端每次请求都会带上完整历史，等于每次
- * 都让模型失忆。这里按 OpenAI 语义完整映射：
- *   - system 消息 → Gemini 的 systemInstruction（它不属于 contents）
- *   - assistant → model（Gemini 的助手角色叫 model，不叫 assistant）
- *   - user → user
- *   - 多条 system 合并；非字符串 content 兜底转成字符串
- */
-function toGeminiContents(messages) {
-  const contents = [];
-  const systemParts = [];
-  for (const m of Array.isArray(messages) ? messages : []) {
-    if (!m) continue;
-    const text = typeof m.content === "string"
-      ? m.content
-      : (m.content == null ? "" : JSON.stringify(m.content));
-    if (m.role === "system") {
-      if (text) systemParts.push(text);
-      continue;
-    }
-    const role = m.role === "assistant" ? "model" : "user";
-    contents.push({ role, parts: [{ text }] });
-  }
-  // Gemini 要求 contents 非空且首条为 user
-  if (contents.length === 0) contents.push({ role: "user", parts: [{ text: "" }] });
-  return { contents, systemParts };
-}
-
-async function callGemini(req, env) {
-  const modelId = req.model.replace(/^gemini\//, "");
-  const { contents, systemParts } = toGeminiContents(req.messages);
-  const payload = {
-    contents,
-    generationConfig: { temperature: 0.7, maxOutputTokens: 8192 }
-  };
-  if (systemParts.length) {
-    payload.systemInstruction = { parts: [{ text: systemParts.join("\n\n") }] };
-  }
-  const url = `https://generativelanguage.googleapis.com/v1beta/models/${modelId}:generateContent?key=${env.GEMINI_API_KEY}`;
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload)
-  });
-  if (!r.ok) throw new Error("gemini " + r.status + ": " + await r.text());
-  const d = await r.json();
-  // Convert to OpenAI format
-  const text = d.candidates?.[0]?.content?.parts?.[0]?.text || "";
-  return new Response(JSON.stringify({
-    id: "chatcmpl-" + Date.now(),
-    object: "chat.completion",
-    created: Math.floor(Date.now() / 1000),
-    model: req.model,
-    choices: [{
-      index: 0,
-      message: { role: "assistant", content: text },
-      finish_reason: "stop"
-    }],
-    usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-  }), { headers: { "Content-Type": "application/json" } });
-}
-
-async function callOpenAICompat(req, env, base, modelId, keyName) {
-  const apiKey = env[keyName];
-  if (!apiKey) throw new Error("missing secret: " + keyName);
-  const upstream = { ...req, model: modelId, stream: false };
-  const r = await fetch(base + "/chat/completions", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "Authorization": "Bearer " + apiKey
-    },
-    body: JSON.stringify(upstream)
-  });
-  if (!r.ok) throw new Error("upstream " + r.status + ": " + await r.text());
-  return r;
-}
-
-// ---- Routes ----
-async function handleHealth() {
-  return new Response(JSON.stringify({ status: "ok", service: "iceProxy" }), {
-    headers: { "Content-Type": "application/json", ...corsHeaders() }
-  });
-}
-
-async function handleModels() {
-  const models = Object.keys(PROVIDERS).map(id => ({
-    id, object: "model", created: 0, owned_by: id.split("/")[0]
-  }));
-  return new Response(JSON.stringify({ object: "list", data: models }), {
-    headers: { "Content-Type": "application/json", ...corsHeaders() }
-  });
-}
-
-async function handleChat(req, env, pool) {
-  const model = req.model || DEFAULT_MODEL;
-  const provider = PROVIDERS[model];
-  if (!provider) {
-    return new Response(JSON.stringify({ error: "unknown model: " + model }), {
-      status: 400, headers: { "Content-Type": "application/json", ...corsHeaders() }
-    });
-  }
-  let upstreamResp;
-  try {
-    if (provider.type === "qwen-oauth") {
-      upstreamResp = await callQwenOAuth(req, env, pool);
-    } else if (provider.type === "gemini-key") {
-      upstreamResp = await callGemini(req, env);
-    } else if (provider.type === "openai-key") {
-      const modelId = model.split("/").slice(1).join("/");
-      let base = provider.base;
-      let keyName = "OPENAI_COMPAT_KEY";
-      if (model.startsWith("glm/")) keyName = "GLM_API_KEY";
-      else if (model.startsWith("cerebras/")) keyName = "CEREBRAS_API_KEY";
-      else if (model.startsWith("openrouter/")) keyName = "OPENROUTER_API_KEY";
-      upstreamResp = await callOpenAICompat(req, env, base, modelId, keyName);
-    }
-  } catch (e) {
-    return new Response(JSON.stringify({ error: { message: e.message, type: "proxy_error" } }), {
-      status: 502, headers: { "Content-Type": "application/json", ...corsHeaders() }
-    });
-  }
-  // Pass through with CORS
-  const headers = new Headers(upstreamResp.headers);
-  for (const [k, v] of Object.entries(corsHeaders())) headers.set(k, v);
-  return new Response(upstreamResp.body, { status: upstreamResp.status, headers });
-}
-
-async function handleAuthStart(env) {
-  const data = await startQwenAuth();
-  return new Response(JSON.stringify({
-    device_code: data.device_code,
-    user_code: data.user_code,
-    verification_uri: data.verification_uri,
-    verification_uri_complete: data.verification_uri_complete,
-    expires_in: data.expires_in,
-    interval: data.interval || 5,
-    code_verifier: data.code_verifier
-  }), { headers: { "Content-Type": "application/json", ...corsHeaders() } });
-}
-
-async function handleAuthPoll(req, env, pool) {
-  const { device_code, code_verifier, account_id } = req;
-  if (!device_code || !code_verifier) {
-    return new Response(JSON.stringify({ error: "missing device_code or code_verifier" }), {
-      status: 400, headers: { "Content-Type": "application/json", ...corsHeaders() }
-    });
-  }
-  const r = await pollQwenToken(device_code, code_verifier);
-  if (r.status === 200) {
-    const id = account_id || ("qwen_" + Date.now());
-    await pool.saveAccount(id, {
-      access_token: r.data.access_token,
-      refresh_token: r.data.refresh_token,
-      expires_at: Math.floor(Date.now() / 1000) + (r.data.expires_in || 3600),
-      type: "qwen-oauth",
-      created_at: new Date().toISOString()
-    });
-    return new Response(JSON.stringify({ status: "ok", account_id: id }), {
-      headers: { "Content-Type": "application/json", ...corsHeaders() }
-    });
-  }
-  return new Response(JSON.stringify(r.data), {
-    status: r.status, headers: { "Content-Type": "application/json", ...corsHeaders() }
-  });
-}
-
-async function handleAdminHealth(req, env, pool) {
-  if (env.ADMIN_SECRET) {
-    const auth = req.headers.get("Authorization") || "";
-    if (auth !== "Bearer " + env.ADMIN_SECRET) {
-      return new Response("forbidden", { status: 403 });
-    }
-  }
-  const ids = await pool.listAccounts();
-  const accounts = [];
-  for (const id of ids) {
-    const acc = await pool.getAccount(id);
-    accounts.push({
-      id,
-      has_token: !!acc?.access_token,
-      expires_in_min: acc ? Math.max(0, Math.floor((acc.expires_at - Date.now() / 1000) / 60)) : 0,
-      failed: pool.failedToday.has(id)
-    });
-  }
-  return new Response(JSON.stringify({ total: ids.length, accounts }), {
-    headers: { "Content-Type": "application/json", ...corsHeaders() }
-  });
-}
-
-// ---- Main handler ----
-// 供单元测试使用的具名导出（Cloudflare Worker 运行时只认 default）
-export { PROVIDERS, DEFAULT_MODEL, checkApiKey, corsHeaders, toGeminiContents };
+export {
+  PROVIDERS,
+  MODELS,
+  DEFAULT_MODEL,
+  catalog,
+  corsHeaders,
+  AccountPool,
+  AuthFailure
+};
 
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    
+    const path = url.pathname.replace(/\/+$/, "") || "/";
+
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders() });
     }
-    
-    if (url.pathname === "/" || url.pathname === "/health") {
-      return handleHealth();
-    }
-    if (url.pathname === "/v1/models") {
-      return handleModels();
-    }
-    if (url.pathname === "/v1/chat/completions") {
-      if (!checkApiKey(request, env)) {
-        return new Response(JSON.stringify({ error: "invalid api key" }), {
-          status: 401, headers: { "Content-Type": "application/json", ...corsHeaders() }
+
+    const pool = new AccountPool(env);
+
+    try {
+      if (path === "/" || path === "/health") {
+        return handleHealth(env);
+      }
+      if (path === "/v1/models" && request.method === "GET") {
+        if (!checkApiKey(request, env)) return unauthorized();
+        return await handleModels(env, pool);
+      }
+      if (path === "/v1/chat/completions" && request.method === "POST") {
+        if (!checkApiKey(request, env)) return unauthorized();
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return errorResponse("请求体不是合法 JSON");
+        }
+        if (!body || typeof body !== "object") {
+          return errorResponse("请求体必须是 JSON 对象");
+        }
+        return await handleChat(body, env, pool, !!body.stream);
+      }
+      if (path === "/v1/auth/start" && request.method === "POST") {
+        if (!checkApiKey(request, env)) return unauthorized();
+        const d = await startQwenAuth();
+        return ok({
+          device_code: d.device_code,
+          user_code: d.user_code,
+          verification_uri: d.verification_uri,
+          verification_uri_complete: d.verification_uri_complete,
+          expires_in: d.expires_in,
+          interval: d.interval || 5,
+          code_verifier: d.code_verifier
         });
       }
-      const body = await request.json();
-      const pool = new AccountPool(env);
-      return handleChat(body, env, pool);
-    }
-    if (url.pathname === "/v1/auth/start" && request.method === "POST") {
-      return handleAuthStart(env);
-    }
-    if (url.pathname === "/v1/auth/poll" && request.method === "POST") {
-      if (!checkApiKey(request, env)) {
-        return new Response("unauthorized", { status: 401, headers: corsHeaders() });
+      if (path === "/v1/auth/poll" && request.method === "POST") {
+        if (!checkApiKey(request, env)) return unauthorized();
+        const body = await request.json().catch(() => ({}));
+        if (!body.device_code || !body.code_verifier) {
+          return errorResponse("缺少 device_code 或 code_verifier");
+        }
+        const r = await pollQwenToken(body.device_code, body.code_verifier);
+        if (r.status === 200 && r.data.access_token) {
+          const id = body.account_id || `qwen_${Date.now()}`;
+          await pool.put(id, {
+            access_token: r.data.access_token,
+            refresh_token: r.data.refresh_token,
+            expires_at: Math.floor(Date.now() / 1000) + (r.data.expires_in || 3600),
+            type: "qwen-oauth",
+            created_at: new Date().toISOString()
+          });
+          return ok({ status: "ok", account_id: id });
+        }
+        // 把上游的原始错误体透传，前端据此区分 pending / slow_down
+        return new Response(JSON.stringify(r.data), {
+          status: r.status === 200 ? 400 : r.status,
+          headers: { "Content-Type": "application/json", ...corsHeaders() }
+        });
       }
-      const body = await request.json();
-      const pool = new AccountPool(env);
-      return handleAuthPoll(body, env, pool);
+      if (path === "/admin/health" && request.method === "GET") {
+        return await handleAdminHealth(request, env, pool);
+      }
+      return errorResponse(`no route: ${path}`, {
+        status: 404,
+        type: "invalid_request_error",
+        code: "not_found"
+      });
+    } catch (e) {
+      console.error("unhandled", e?.stack || e);
+      return errorResponse(`内部错误：${e?.message || e}`, { status: 500, type: "internal_error" });
     }
-    if (url.pathname === "/admin/health") {
-      const pool = new AccountPool(env);
-      return handleAdminHealth(request, env, pool);
-    }
-    return new Response("not found", { status: 404, headers: corsHeaders() });
   }
 };
+
+function unauthorized() {
+  return errorResponse("无效的 API key", { status: 401, type: "authentication_error", code: "invalid_api_key" });
+}
+
+/** 管理端健康检查。ADMIN_SECRET 未配置时拒绝访问，避免泄露账号列表。 */
+async function handleAdminHealth(request, env, pool) {
+  const secret = env?.ADMIN_SECRET;
+  if (!secret) {
+    return errorResponse("未配置 ADMIN_SECRET，管理端点已关闭", {
+      status: 403,
+      type: "permission_error",
+      code: "admin_disabled"
+    });
+  }
+  const auth = request.headers.get("Authorization") || "";
+  const provided = auth.replace(/^Bearer\s+/i, "");
+  if (!timingSafeEqual(String(secret), provided)) {
+    return errorResponse("无权访问", { status: 403, type: "permission_error" });
+  }
+  const ids = await pool.list();
+  const accounts = [];
+  for (const id of ids) {
+    const acc = await pool.get(id);
+    accounts.push({
+      id,
+      has_token: !!acc?.access_token,
+      expires_in_min: acc?.expires_at
+        ? Math.max(0, Math.floor((acc.expires_at - Date.now() / 1000) / 60))
+        : 0,
+      cooling_down_until: acc?.cooldown_until ? new Date(acc.cooldown_until).toISOString() : null,
+      last_error: acc?.last_error ?? null
+    });
+  }
+  const providers = {};
+  for (const [prefix, p] of Object.entries(PROVIDERS)) {
+    providers[prefix] = p.auth === "qwen-oauth" ? ids.length > 0 : !!resolveApiKey(p, env);
+  }
+  return ok({ total: ids.length, accounts, providers });
+}
