@@ -1,20 +1,24 @@
 {
   "name": "ice-proxy",
-  "version": "1.0.0",
-  "description": "OpenAI-compatible proxy for 8 free AI models across 5 providers (Qwen OAuth x3, Gemini x2, GLM, Cerebras, OpenRouter)",
+  "version": "2.0.0",
+  "description": "One OpenAI-compatible endpoint for 18 free AI models across 6 providers (Qwen / Gemini / GLM / Cerebras / Groq / OpenRouter)",
   "main": "src/worker.js",
   "scripts": {
+    "test": "node --test test/*.test.mjs",
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
     "auth:add": "node scripts/auth.js add",
     "auth:list": "node scripts/auth.js list",
     "auth:deploy": "node scripts/auth.js deploy",
     "auth:list-kv": "node scripts/auth.js list-kv",
-    "test": "node --test test/*.test.mjs"
+    "check": "node --check src/worker.js && node --test test/*.test.mjs"
   },
   "devDependencies": {
     "wrangler": "^3.80.0"
   },
   "license": "MIT",
-  "type": "module"
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  }
 }

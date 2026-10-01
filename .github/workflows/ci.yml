@@ -2,32 +2,55 @@ name: CI
 
 on:
   push:
-    branches: [ main, master ]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 20 是 engine 下限，22 是当前 LTS。两条都测 ——
+        # 只在一条上绿过，就没资格说「支持多版本」。
+        node-version: ["20", "22"]
     steps:
       - uses: actions/checkout@v4
-
-      - name: Set up Node 20
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: ${{ matrix.node-version }}
 
-      # 只跑单元测试，不装 wrangler —— wrangler 只在部署时需要，
-      # 而单元测试是零依赖的（node:test + node:assert）
-      - name: Unit tests
+      # 单元测试零依赖（node:test + node:assert），所以不装 wrangler。
+      # 这本身是个需要守住的特性：装依赖会让 CI 变慢，也会引入供应链面。
+      - name: 单元测试
         run: npm test
 
-  syntax:
+      - name: 语法检查（所有源文件，不只 worker.js）
+        run: |
+          for f in src/*.js scripts/*.js test/*.mjs; do
+            node --check "$f" || exit 1
+          done
+
+  docs-sync:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '20'
-      - name: Check worker.js syntax
-        run: node --check src/worker.js
+          node-version: "22"
+      # README 里列出的模型必须和代码里的目录一致。
+      # 上一版 README 写着「7 个模型」，代码里是 8 个，一个都对不上 ——
+      # 这条守的就是那个故障：文档与代码各自漂移。
+      - name: README 与 src/providers.js 的模型清单必须一致
+        run: node scripts/check-docs.mjs
+
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deploy.sh 语法与静态检查
+        run: |
+          bash -n deploy.sh
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          shellcheck -S warning deploy.sh || true
