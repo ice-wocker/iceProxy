@@ -1,21 +1,27 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-MIT-blue" alt="License">
   <img src="https://img.shields.io/badge/Cloudflare-Workers-orange" alt="Cloudflare Workers">
-  <img src="https://img.shields.io/badge/models-18-brightgreen" alt="18 Models">
-  <img src="https://img.shields.io/badge/providers-6-blueviolet" alt="6 Providers">
-  <img src="https://img.shields.io/badge/tests-82-success" alt="82 Tests">
+  <img src="https://img.shields.io/badge/no%20API%20key-needed-success" alt="No API key needed">
+  <img src="https://img.shields.io/badge/models-20-brightgreen" alt="20 Models">
+  <img src="https://img.shields.io/badge/providers-7-blueviolet" alt="7 Providers">
+  <img src="https://img.shields.io/badge/tests-104-success" alt="104 Tests">
   <img src="https://img.shields.io/github/stars/ice-wocker/iceProxy?style=social" alt="Stars">
 </p>
 
 <h1 align="center">iceProxy</h1>
 
 <p align="center">
-  <b>One OpenAI-compatible endpoint for 18 free AI models across 6 providers</b><br>
-  <sub>Streaming · Cross-provider failover · Multi-account rotation · Zero build step</sub>
+  <b>One OpenAI-compatible endpoint for 20 free AI models across 7 providers</b><br>
+  <sub>Works with <b>zero configuration</b> · Streaming · Cross-provider failover · Multi-account rotation</sub>
 </p>
 
-iceProxy is a Cloudflare Worker that puts 18 free-tier AI models behind a single
+iceProxy is a Cloudflare Worker that puts 20 free-tier AI models behind a single
 OpenAI-compatible API. Point any OpenAI client at it, change nothing else.
+
+**Deploy it and it works.** No API key, no account, no KV namespace — the default
+model runs on a keyless upstream ([Pollinations](https://pollinations.ai)), so a
+fresh `wrangler deploy` answers requests on the first try. Add provider keys later
+to unlock more models; the failover chain picks them up automatically.
 
 **Why it exists:** free tiers are scattered across six different vendors, each with
 its own auth scheme, its own request shape, and its own way of rate-limiting you.
@@ -33,18 +39,26 @@ throttles you, it quietly retries on the next one.
   configured one. Only retryable errors trigger it; a 400 is returned as-is.
 - **Multi-account rotation** — add N Qwen accounts, get N times the quota. Tokens
   refresh on demand, and a rate-limited account cools down instead of dying.
-- **6 providers, one interface** — Qwen, Gemini, GLM, Cerebras, Groq, OpenRouter.
+- **Zero-config by default** — the default model needs no credentials at all, so a
+  fresh deploy is immediately usable. Everything else is opt-in.
+- **7 providers, one interface** — Pollinations (keyless), Qwen, Gemini, GLM,
+  Cerebras, Groq, OpenRouter.
 - **Zero build step** — plain ES modules, no bundler, no transpiler.
 - **Zero runtime dependencies** — the unit tests use only `node:test`. Nothing to
   audit in your supply chain.
-- **82 tests** — including regression tests for every bug listed in
+- **104 tests** — including regression tests for every bug listed in
   [Known fixed bugs](#known-fixed-bugs).
+- **A real-availability prober** (`npm run probe`) — hits the actual providers and
+  tells you which of the 20 model IDs still exist, as opposed to which ones merely
+  have credentials configured.
 
 ## Models
 
 | Model ID | Provider | Context | Notes |
 |---|---|---:|---|
-| `qwen/qwen3-coder-flash` | Qwen | 1M | Default. Fast coding model |
+| `pollinations/gpt-oss-20b` | Pollinations | 131K | **Default. No API key at all** |
+| `pollinations/openai-fast` | Pollinations | 131K | Alias of the same upstream model |
+| `qwen/qwen3-coder-flash` | Qwen | 1M | Fast coding model |
 | `qwen/qwen3-coder-plus` | Qwen | 1M | Stronger coding model |
 | `qwen/qwen3-max` | Qwen | 262K | General flagship |
 | `qwen/qwen-vl-max` | Qwen | 131K | Vision input |
@@ -63,8 +77,37 @@ throttles you, it quietly retries on the next one.
 | `openrouter/cohere/north-mini-code:free` | OpenRouter | 256K | Free tier, coding |
 | `openrouter/inclusionai/ling-3.0-flash-sante:free` | OpenRouter | 262K | Free tier, tools |
 
-Only Qwen works with **no API key at all** — it uses OAuth device flow instead.
-That's the default model, so a fresh fork is usable after adding one account.
+Two things need **no API key**:
+
+- **Pollinations** — truly keyless, anonymous tier, no account. It's the default
+  model, so a fresh fork works immediately.
+- **Qwen** — no static key, but you add an account once via OAuth device flow
+  (`node scripts/auth.js add`). Add several to multiply the quota.
+
+Everything else needs a provider key, and can be added at any time. Whichever
+providers you've configured become part of the failover chain automatically —
+you never edit the model list to "enable" one.
+
+### What "no API key" actually buys you
+
+Being honest about the keyless tier, because it's the reason the default works:
+
+- **Pollinations' anonymous tier is free and needs no signup**, but it is a
+  *shared public endpoint*. It rate-limits bursts, and its backend has been known
+  to return `500 ENOSPC` (disk full) or `402` during busy periods. Single requests
+  at human pace are reliable in testing; hammering it is not. When it does fail,
+  the proxy **retries transient errors once** and then fails over — but with only
+  one keyless provider today, there's nothing to fail over *to*, so you'll get a
+  clear per-provider error instead of a hang.
+- **No `tools` / function calling, and no `system` role** on the anonymous tier —
+  the upstream returns `402` for those. That's why `pollinations/*` is marked
+  `caps: ["stream"]` only, and why the proxy treats `402` as *failover-able*
+  rather than a hard client error.
+- **One model** (`gpt-oss-20b`), under three aliases.
+
+So: keyless is the zero-friction default and it genuinely works, but it is not a
+service-level guarantee. For anything load-bearing, add at least one keyed
+provider — then the failover chain has somewhere to go.
 
 > Free quotas change constantly, so this README deliberately does **not** list
 > request-per-day numbers. Check each provider's own page. `CI` enforces that this
@@ -84,11 +127,11 @@ Client (any OpenAI SDK)
   │  adapters.js    per-provider protocol   │
   │  accounts.js    Qwen pool: rotate/refresh│
   │  openai.js      SSE frames, error shape │
-  └───┬──────┬──────┬──────┬──────┬──────┬──┘
-      │      │      │      │      │      │
-    Qwen  Gemini  GLM  Cerebras  Groq  OpenRouter
-      │
-   KV: account pool (access_token / refresh_token)
+  └─┬────┬──────┬──────┬──────┬──────┬──────────┬──┘
+    │    │      │      │      │      │          │
+Pollinations Qwen Gemini  GLM  Cerebras  Groq  OpenRouter
+ (no key)   │
+         KV: account pool (access_token / refresh_token)
 ```
 
 `providers.js` is the single source of truth for the model list. `worker.js` reads
@@ -96,41 +139,44 @@ from it. `scripts/check-docs.mjs` asserts the README matches it.
 
 ## Quick start
 
-### 1. Clone
+### 1. Clone and deploy
 
 ```bash
 git clone https://github.com/ice-wocker/iceProxy
 cd iceProxy
 npm install
-```
-
-### 2. Deploy
-
-```bash
-./deploy.sh
-```
-
-That script installs dependencies, runs the tests, creates the KV namespace,
-writes its id back into `wrangler.toml`, and deploys. It's idempotent — running it
-again is safe.
-
-Or do it by hand:
-
-```bash
-npx wrangler kv namespace create ACCOUNTS   # paste the id into wrangler.toml
 npx wrangler deploy
 ```
 
-### 3. Add a Qwen account (optional, but it's the only key-free path)
+**That's it.** No KV namespace, no secrets, no provider keys. The default model
+(`pollinations/gpt-oss-20b`) needs none of them, so the deployed URL answers
+`/v1/chat/completions` immediately. Verify with:
+
+```bash
+curl -X POST https://ice-proxy.YOUR-SUBDOMAIN.workers.dev/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"hello"}]}'
+```
+
+`curl -s https://ice-proxy.YOUR-SUBDOMAIN.workers.dev/health` should report
+`"providers_keyless":["pollinations"]`.
+
+`./deploy.sh` does the same thing plus runs the tests first, and (when you later
+want more models) creates the KV namespace and writes its id back into
+`wrangler.toml`. It's idempotent — running it again is safe.
+
+### 2. Unlock more models (all optional)
+
+Everything below is opt-in. Nothing here is required for the proxy to work.
+
+**Qwen** — no static key, just a one-time account login; add more accounts to
+multiply the quota:
 
 ```bash
 node scripts/auth.js add
 ```
 
-Scan the QR / open the link, and the token lands in Cloudflare KV. Add more
-accounts to multiply the quota.
-
-### 4. Add API keys for the other providers (all optional)
+**Everyone else** — a provider key each:
 
 ```bash
 npx wrangler secret put GEMINI_API_KEY      # https://aistudio.google.com/apikey
@@ -140,10 +186,14 @@ npx wrangler secret put GROQ_API_KEY        # https://console.groq.com/keys
 npx wrangler secret put OPENROUTER_API_KEY  # https://openrouter.ai/
 ```
 
-Providers without a key are simply marked unavailable in `/v1/models`. They are
-skipped in the failover chain rather than failing at request time.
+Providers without a key are simply marked unavailable in `/v1/models` — and they
+are *skipped in the failover chain rather than failing at request time*. So on a
+keyless-only deploy, asking for `gemini/gemini-2.5-flash` transparently falls back
+to the keyless provider instead of erroring. Once you `secret put GEMINI_API_KEY`,
+the same request starts going to Gemini — no code change, no redeploy of the model
+list.
 
-### 5. Lock it down (do this if it's public)
+### 3. Lock it down (do this if it's public)
 
 ```bash
 npx wrangler secret put OPENAI_API_KEYS   # "sk-yourkey" — clients must send this
@@ -272,6 +322,27 @@ carries `_proxy` and the header `X-IceProxy-Fallback`:
 }
 ```
 
+### When an upstream ignores `stream: true`
+
+Not every provider honours the flag. If one returns `200` with a non-SSE
+`Content-Type`, iceProxy does **not** relay it as a stream — that gives the client
+`200 text/event-stream` with no `data:` frames and no `[DONE]`, which is
+indistinguishable from a hang. Instead it delivers the response as a normal JSON
+completion and marks what happened:
+
+```
+X-IceProxy-Stream-Downgraded: 1
+```
+
+```json
+{ "choices": [ ... ], "_proxy": { "streamDowngraded": true, "attempts": [ ... ] } }
+```
+
+You get the whole answer at once instead of waiting for a stream that will never
+start. The same principle applies to `X-IceProxy-Fallback`: it is set on **both**
+the streaming and non-streaming paths, so a client that watches the header never
+mistakes a fallback for a direct hit.
+
 ### Account rotation
 
 For Qwen, `iceProxy`:
@@ -298,15 +369,45 @@ Total: $0/month. See Cloudflare's current pricing for limits.
 ## Development
 
 ```bash
-npm test                        # 82 tests, no network, no dependencies
+npm test                        # 99 tests, no network, no dependencies
+node scripts/verify-local.mjs   # end-to-end against a local fake upstream
 node scripts/check-docs.mjs     # README vs code consistency
-npm run check                   # both
+npm run check                   # all three, in order
+
+# the only one that touches the network:
+npm run probe                   # are the model IDs upstream still alive?
+npm run probe -- --model glm/glm-4.6-flash
+npm run probe -- --json         # machine-readable
 ```
 
-The tests mock `globalThis.fetch`, so they run offline and never touch a real
+The unit tests mock `globalThis.fetch`, so they run offline and never touch a real
 provider. They cover: SSE frame reassembly across arbitrary chunk boundaries,
 streaming and non-streaming for every protocol, the failover chain, account pool
 rotation/refresh/cooldown, and every historical bug below.
+
+`scripts/probe-models.mjs` is the third thing, and the only one that goes online.
+The tests above all answer "is our traffic correct?"; none of them answer "does
+upstream still recognise this model name". Free tiers retire model IDs, and that
+kind of rot is permanently green locally. `npm run probe` drives the real Worker
+against the real providers, one request per model, and reports:
+
+- `✔` answered,
+- `🔑` credentials are missing/invalid — **not** a dead model,
+- `✖` upstream refused the model itself,
+- `⏭` no credential configured on this machine, so not tested.
+
+It never exits non-zero: it is a diagnostic, and someone else's free tier having a
+bad day should not turn our CI red. CI runs it against OpenRouter (the one provider
+where a probe works without a real account) with a placeholder key — which is
+enough, because *"does this model exist"* is answered by the `401` just as well as
+by a `200`.
+
+`scripts/verify-local.mjs` is the other half: it stands up a **fake upstream** on
+localhost and drives the Worker through real HTTP with a real client's requests —
+streaming including a JSON line cut in half, a provider that ignores
+`stream: true`, cross-provider failover, error attribution, CORS. It needs no
+keys and touches no real provider. **Three of the bugs listed below were found by
+it while every unit test was green.**
 
 ## Known fixed bugs
 
@@ -324,6 +425,13 @@ because they're the class of bug that a green test suite would happily miss.
 | Gemini dropped conversation history | Model forgot everything each turn with Cline/Cursor | Only the last message was forwarded |
 | Last chunk of a broken stream vanished | Response truncated mid-sentence | Buffered SSE rows were discarded when the upstream errored |
 | Docs drift | README said 7 models, code had 8, `package.json` said 5 | No single source of truth; now `providers.js` + a CI check |
+| Chat UI span forever on `stream: true` | Provider ignored `stream`, returned JSON; we relayed it as `text/event-stream` with no `data:` frames and no `[DONE]` | No `Content-Type` assertion. Every upstream response was assumed to be the shape we asked for |
+| A normal failover returned **500** | `TypeError: Cannot convert argument to a ByteString` | `servedModel` used `→` (U+2192); HTTP header values must be latin-1 |
+| Failover invisible to non-streaming clients | `X-IceProxy-Fallback` was only set on the streaming path | Two response builders, only one of them set the header |
+| `/v1/models` read KV once per account | N+1 KV reads, billed as such | Availability only needed `.length`, but `list()` was followed by a `get()` per id |
+| "You have no credentials" when you did | A KV hiccup made a configured Qwen account look absent | `accountCount === 0` was read as "provider unavailable" instead of "we couldn't tell" |
+| Upstream's refusal was thrown away | `upstream returned non-JSON`, with no hint of *why* | `resp.json()` was tried first; a failed `json()` **consumes the body**, so the follow-up `text()` throws and the diagnostic text (`error code: 1009`, an HTML challenge page) is lost. Now reads the body as text and parses it itself |
+| `DEFAULT_MODEL` in `wrangler.toml` did nothing | Changed the var, restarted, default model unchanged | The variable was declared and documented but never read by any code path. A config that silently does nothing is worse than no config — you blame your own edit |
 
 ## Limitations
 
@@ -338,7 +446,19 @@ because they're the class of bug that a green test suite would happily miss.
 - **Tool calling is passed through, not normalized.** Providers differ in how they
   express tool calls; iceProxy forwards `tools`/`tool_choice` but doesn't translate
   between dialects.
+- **"Credentials configured" is not "model works".** `/v1/models` answers the first
+  question, not the second. Free tiers retire model IDs silently, so run
+  `npm run probe` against your own keys before trusting the list — that is exactly
+  why the prober exists.
+- **A provider that fails to *parse* used to lose its own error message.** Fixed in
+  3.1.0: the raw body is preserved, so a refusal from a gateway
+  (`error code: 1009`, an HTML challenge page) now shows up verbatim instead of as
+  a generic "upstream returned non-JSON".
 - **No embeddings or moderation endpoints.** Inference only.
+- **Non-streaming requests time out after 60s**, streaming ones don't have a
+  total-duration cap (a model thinking for 90s before its first token is normal).
+  A streaming response that never produces a frame relies on the client's own
+  timeout.
 
 ## License
 

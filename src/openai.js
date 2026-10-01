@@ -34,8 +34,8 @@ export function upstreamError(message, status = 502) {
   return errorResponse(message, { status, type: "upstream_error" });
 }
 
-export function ok(obj) {
-  return json(obj);
+export function ok(obj, extra = {}) {
+  return json(obj, 200, extra);
 }
 
 /** 生成一个 OpenAI 风格的 chatcmpl id。 */
@@ -104,8 +104,8 @@ export function streamHeaders(extra = {}) {
   };
 }
 
-export function streamResponse(body) {
-  return new Response(body, { status: 200, headers: streamHeaders() });
+export function streamResponse(body, extra = {}) {
+  return new Response(body, { status: 200, headers: streamHeaders(extra) });
 }
 
 /**

@@ -2,19 +2,20 @@ name = "ice-proxy"
 main = "src/worker.js"
 compatibility_date = "2025-01-01"
 
-# ── KV：存 Qwen OAuth 账号 ─────────────────────────────────
+# ── KV：存 Qwen OAuth 账号（可选）──────────────────────────
 # 创建： npx wrangler kv namespace create ACCOUNTS
-# 把返回的 id 填进下面（用 `npm run setup` 会自动填，不用手改这个文件）
+# 把返回的 id 填进下面（`./deploy.sh` 会自动创建并写回，不用手改这个文件）
 #
-# 不配 KV 也能部署，只是 Qwen 那几个模型不可用（它们需要账号池），
-# 其它用静态密钥的 provider 不受影响。
+# **不配 KV 也是完整可用的**：默认模型走免密钥的 Pollinations，不需要任何账号。
+# 只有想用 Qwen 那几个模型时才需要 KV。
 [[kv_namespaces]]
 binding = "ACCOUNTS"
 id = "REPLACE_WITH_KV_ID"
 
 [vars]
-# 默认模型。留空则用 src/providers.js 里的 DEFAULT_MODEL。
-# 想换默认模型改这里，不用改代码（也不用重新部署代码，改 vars 即可）。
+# 默认模型。留空则用 src/providers.js 里的 DEFAULT_MODEL
+# （pollinations/gpt-oss-20b —— 不需要任何密钥的那个）。
+# 换默认模型改这里即可，不用改代码。写了非法 id 会告警并回退，不会让 Worker 起不来。
 DEFAULT_MODEL = ""
 
 # ── 密钥（用 wrangler secret put 设置，别写在这个文件里）──────
@@ -26,5 +27,6 @@ DEFAULT_MODEL = ""
 #   npx wrangler secret put GROQ_API_KEY        # https://console.groq.com/keys
 #   npx wrangler secret put OPENROUTER_API_KEY  # https://openrouter.ai/
 #
-# 一个都没配也能跑 —— 用 `node scripts/auth.js add` 加 Qwen 账号即可，
-# 那条链路不需要任何静态密钥。
+# 一个都不配也完全能跑：默认模型用的是免密钥的 Pollinations（auth = "none"），
+# 零密钥、零账号、零 KV 即可回答请求。想解锁更多模型时再按上面逐条加 ——
+# 配了哪个 provider，哪个就自动进入回退链，不用改模型清单。

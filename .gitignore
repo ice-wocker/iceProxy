@@ -1,6 +1,7 @@
-node_modules/
+# wrangler dev 的本地状态（含 KV 的本地副本）
 .wrangler/
 .dev.vars
+node_modules/
 # 本地 OAuth 凭据，等同账号权限，绝不能提交
 .iceProxy/
 *.log

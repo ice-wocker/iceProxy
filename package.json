@@ -1,20 +1,24 @@
 {
   "name": "ice-proxy",
-  "version": "2.0.0",
-  "description": "One OpenAI-compatible endpoint for 18 free AI models across 6 providers (Qwen / Gemini / GLM / Cerebras / Groq / OpenRouter)",
+  "version": "4.0.0",
+  "description": "One OpenAI-compatible endpoint for 20 free AI models across 7 providers — works with zero configuration (no API key)",
   "main": "src/worker.js",
   "scripts": {
     "test": "node --test test/*.test.mjs",
-    "deploy": "wrangler deploy",
+    "verify": "node scripts/verify-local.mjs",
+    "check-docs": "node scripts/check-docs.mjs",
+    "probe": "node scripts/probe-models.mjs",
+    "syntax": "for f in src/*.js scripts/*.js test/*.mjs; do node --check \"$f\" || exit 1; done",
+    "check": "npm run syntax && npm test && npm run check-docs && npm run verify",
     "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
     "auth:add": "node scripts/auth.js add",
     "auth:list": "node scripts/auth.js list",
     "auth:deploy": "node scripts/auth.js deploy",
-    "auth:list-kv": "node scripts/auth.js list-kv",
-    "check": "node --check src/worker.js && node --test test/*.test.mjs"
+    "auth:list-kv": "node scripts/auth.js list-kv"
   },
   "devDependencies": {
-    "wrangler": "^3.80.0"
+    "wrangler": "^4.145.0"
   },
   "license": "MIT",
   "type": "module",

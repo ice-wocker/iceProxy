@@ -85,6 +85,84 @@ for (const prefix of usedPrefixes) {
   }
 }
 
+// ---- 7. 行为清单：README 说有的，代码里必须真的有 ----
+//
+// 为什么要单独守这个：模型清单有 check-docs 守着（因为模型是「数据」，
+// 能从 providers.js 读），但**行为**类的东西没人守。上一版就是这么飘的 ——
+// README 写着「跨 provider 自动故障转移」，代码里只有 Qwen 的账号轮换，
+// 文档描述了一个不存在的功能，而所有测试都是绿的。
+//
+// 这里做的是一个廉价的「存在性锚点」：README 里提到某个行为，
+// 就必须能在源码里找到对应的实现符号。它挡不住「实现了但实现错了」，
+// 但能挡住「文档在描述一个根本不存在的东西」——这恰恰是上一版发生的。
+//
+// 用法：在 README 里正常写功能描述，锚点写在这张表里。
+// 删功能时这张表会先红，提醒你去同步文档。
+const BEHAVIOR_ANCHORS = [
+  {
+    // README 提到「跨 provider 回退」时，必须真的有候选链构建
+    doc: /failover|回退|故障转移/i,
+    sources: ["src/worker.js"],
+    symbols: ["buildFallbackChain", "isRetryable"],
+    what: "跨 provider 回退"
+  },
+  {
+    doc: /多账号|multi-account|Account rotation|账号轮换/i,
+    sources: ["src/accounts.js"],
+    symbols: ["isTokenFresh", "pick", "refresh", "penalize"],
+    what: "Qwen 账号轮换"
+  },
+  {
+    doc: /Streaming|流式/i,
+    sources: ["src/openai.js", "src/worker.js"],
+    symbols: ["iterSsePayloads", "sseChunk", "streamResponse"],
+    what: "SSE 流式"
+  },
+  {
+    doc: /stream.*downgrad|降级|event-stream/i,
+    sources: ["src/worker.js"],
+    symbols: ["assertStreamingResponse"],
+    what: "上游不给事件流时的降级"
+  },
+  {
+    // README 说 `/health` 只报「哪些密钥已配置」，那就不能回显密钥值
+    doc: /health/i,
+    sources: ["src/worker.js"],
+    symbols: ["handleHealth"],
+    what: "健康检查"
+  }
+];
+
+const sourceCache = new Map();
+async function readSource(rel) {
+  if (!sourceCache.has(rel)) {
+    sourceCache.set(rel, await readFile(new URL("../" + rel, import.meta.url), "utf8"));
+  }
+  return sourceCache.get(rel);
+}
+
+const missingAnchors = [];
+for (const rule of BEHAVIOR_ANCHORS) {
+  if (!rule.doc.test(readme)) continue; // README 没提这个功能，无需验证
+  for (const rel of rule.sources) {
+    let src;
+    try {
+      src = await readSource(rel);
+    } catch {
+      missingAnchors.push(`${rule.what}：找不到 ${rel}`);
+      continue;
+    }
+    for (const sym of rule.symbols) {
+      if (!new RegExp(`\\b${sym}\\b`).test(src)) {
+        missingAnchors.push(`${rule.what}：README 提到了它，但 ${rel} 里没有 ${sym}`);
+      }
+    }
+  }
+}
+for (const m of missingAnchors) {
+  errors.push(`README 描述的行为在代码里找不到落点 —— ${m}`);
+}
+
 // ---- 7. 提醒：README 里不该出现硬编码的免费额度数字 ----
 // 额度是会变的，写死了哪天就变成假信息。改成软提醒，不阻断。
 for (const m of readme.matchAll(/(\d[\d,]*)\s*(req|requests)\s*\/\s*(day|min)/gi)) {

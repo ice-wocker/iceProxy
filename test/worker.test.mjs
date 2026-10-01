@@ -79,12 +79,12 @@ function captureFetch(handler) {
 const jsonResp = (obj, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json" } });
 
-const openAiJson = (content, extra = {}) =>
+const openAiJson = (content, extra = {}, model = "m") =>
   jsonResp({
     id: "up-1",
     object: "chat.completion",
     created: 1,
-    model: "m",
+    model,
     choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
     usage: { prompt_tokens: 5, completion_tokens: 4, total_tokens: 9 },
     ...extra
@@ -192,10 +192,16 @@ test("备好了多个 provider 的密钥时，回退链能跨 provider", () => {
   assert.equal(chain[0].id, "glm/glm-4.6-flash", "首选必须是用户点名的模型");
 });
 
-test("没有 Qwen 账号时，回退链里不该出现 qwen 模型", () => {
-  const chain = buildFallbackChain("qwen/qwen3-max", { GLM_API_KEY: "a" }, 0);
-  assert.ok(!chain.some((e) => e.prefix === "qwen"), "没有账号却把 qwen 排进了候选");
-  assert.ok(chain.some((e) => e.prefix === "glm"), "应该回退到已配置的 glm");
+test("帐号池读出来是空的：qwen 不占第一顺位，让已配密钥的 provider 先试", () => {
+  // accountCount===0 分不清「真没账号」和「KV 没配 / list 失败」，
+  // 所以不把 qwen 从链里摘掉（见 buildFallbackChain 的注释）；
+  // 但也不能让它排在确定能用的 provider 前面 —— 否则一个空账号池
+  // 会永远占着第一顺位白试一次，把真正配好的 provider 挤出 4 次尝试的窗口。
+  const env = { GLM_API_KEY: "a", GEMINI_API_KEY: "b" };
+  const chain = buildFallbackChain("gemini/gemini-2.5-flash", env, 0);
+  const firstQwen = chain.findIndex((e) => e.prefix === "qwen");
+  assert.ok(chain.some((e) => e.prefix === "gemini"), "primary 有密钥，必须在链里");
+  assert.ok(firstQwen === -1 || firstQwen >= 2, `qwen 不该挤在前面：${chain.map((e) => e.id)}`);
 });
 
 test("没有 Qwen 账号但有 3 个账号时，qwen 同 provider 内要有备选", () => {
@@ -204,10 +210,13 @@ test("没有 Qwen 账号但有 3 个账号时，qwen 同 provider 内要有备�
   assert.ok(chain.every((e) => e.prefix === "qwen" || true));
 });
 
-test("一条凭据都没有时，回退链为空（→ 明确报 no_credentials 而不是逐个试错）", () => {
+test("静态密钥 provider 没配密钥时，链为空（→ 明确报 no_credentials 而不是逐个试错）", () => {
   // 曾经的行为：主模型无条件入链，导致「没密钥」时也返回一个非空链，
   // 用户看到的是最后一个 provider 的报错，根本猜不到是缺密钥。
-  assert.deepEqual(buildFallbackChain("gemini/gemini-2.5-flash", {}, 0), []);
+  // 静态密钥 provider 的可用性是**能确定**的（env 里有没有那个 key），
+  // 所以没有密钥就是没有，直接空链。
+  assert.deepEqual(buildFallbackChain("gemini/gemini-2.5-flash", { GLM_API_KEY: "a" }, 0).filter((e) => e.prefix === "gemini"), []);
+  assert.deepEqual(buildFallbackChain("glm/glm-4.6-flash", { GEMINI_API_KEY: "a" }, 0).filter((e) => e.prefix === "glm"), []);
 });
 
 test("未知模型返回空链，由调用方给出「可用模型」清单", () => {
@@ -774,19 +783,190 @@ test("所有 provider 都失败时，错误信息里带上每个尝试的原因"
   assert.ok(o.error.message.includes("503"), o.error.message);
 });
 
-test("缺少密钥时给出明确提示，而不是让它 502", async () => {
-  captureFetch(() => jsonResp({}));
+test("上游回 200 但内容是空的 → 继续回退，而不是透传空答案", async () => {
+  // 真 bug 回归：实测 pollinations 偶发回 `{}`（HTTP 200、无 choices）。
+  // 旧行为是原样透传一个空回答，客户端拿到「成功但没内容」。
+  // 现在它必须被当成一次失败，继续走候选链。
+  let n = 0;
+  const calls = captureFetch(() => {
+    // 只有第一个候选回空，后面的候选正常 —— 模拟上游偶发抽风
+    n++;
+    return n === 1 ? jsonResp({}) : openAiJson("回退后的回答");
+  });
   const r = await worker.fetch(
     new Request("https://x/v1/chat/completions", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "gemini/gemini-2.5-flash", messages: [{ role: "user", content: "hi" }] })
+      body: JSON.stringify({ model: "pollinations/gpt-oss-20b", messages: [{ role: "user", content: "hi" }] })
     }),
     {},
     {}
   );
-  assert.equal(r.status, 400);
-  assert.ok((await r.json()).error.message.includes("凭据"));
+  assert.equal(r.status, 200);
+  const o = await r.json();
+  assert.equal(o.choices[0].message.content, "回退后的回答", "空完成必须触发回退，而不是透传空答案");
+  assert.ok(o._proxy.attempts.some((a) => a.error.includes("空的完成")), JSON.stringify(o._proxy.attempts));
+  assert.ok(calls.length >= 2, "该至少试了两个候选");
+});
+
+test("上游 5xx（瞬时抽风）原地重试一次，而不是立刻换 provider", async () => {
+  // 真 bug 回归：实测 pollinations 会成片回 `ENOSPC`（500）。
+  // 隔一下再试通常就好 —— 直接换 provider 会白白烧掉一个候选名额。
+  let n = 0;
+  captureFetch(() => {
+    n++;
+    if (n === 1) return jsonResp({ error: "ENOSPC: no space left on device" }, 500);
+    return openAiJson("重试后成功");
+  });
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "pollinations/gpt-oss-20b", messages: [{ role: "user", content: "hi" }] })
+    }),
+    {},
+    {}
+  );
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).choices[0].message.content, "重试后成功");
+  assert.equal(n, 2, `5xx 该原地重试一次（共 2 次），实际 ${n}`);
+});
+
+test("429 不原地重试，直接换 provider（限流不会 250ms 就恢复）", async () => {
+  let n = 0;
+  captureFetch(() => {
+    n++;
+    if (n === 1) return jsonResp({ error: { message: "rate limited" } }, 429);
+    return openAiJson("来自备用 provider");
+  });
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "glm/glm-4.6-flash", messages: [{ role: "user", content: "hi" }] })
+    }),
+    { GLM_API_KEY: "a", GROQ_API_KEY: "b" },
+    {}
+  );
+  assert.equal(r.status, 200);
+  assert.equal(n, 2, `429 该只打 2 次（1 次失败 + 1 次换 provider），实际 ${n}`);
+  assert.equal((await r.json())._proxy.fellBack, true, "必须真的换了 provider");
+});
+
+test("402（免费额度耗尽/参数要付费）也换 provider，不当硬错误", async () => {
+  // 实测 pollinations 对 `tools`、`system` 角色回 402 —— 换个 provider 能成。
+  let n = 0;
+  captureFetch(() => {
+    n++;
+    if (n === 1) return jsonResp({}, 402);
+    return openAiJson("别的 provider 能答");
+  });
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "pollinations/gpt-oss-20b", messages: [{ role: "user", content: "hi" }] })
+    }),
+    {},
+    {}
+  );
+  assert.equal(r.status, 200, "402 不该直接抛给客户端");
+  assert.equal((await r.json()).choices[0].message.content, "别的 provider 能答");
+});
+
+test("零配置部署：没配任何密钥也能用（回退到免密钥 provider）", async () => {
+  // 这是本项目的核心承诺 —— fork 完直接跑。挑一个需要密钥的模型，
+  // 期望它自动回退到 pollinations，且返回 200。
+  const calls = captureFetch((rec) => {
+    assert.ok(!rec.url.includes("cerebras"), "不该真的打没配密钥的 cerebras");
+    return openAiJson("无需密钥也能回答", {}, "gpt-oss-20b");
+  });
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "cerebras/llama-3.3-70b", messages: [{ role: "user", content: "hi" }] })
+    }),
+    {},
+    {}
+  );
+  assert.equal(r.status, 200, "零配置也应该能拿到回答");
+  const o = await r.json();
+  assert.equal(o.choices[0].message.content, "无需密钥也能回答");
+  assert.ok(calls.length >= 1);
+});
+
+test("免密钥 provider 不带 Authorization 头", async () => {
+  let sawAuth = null;
+  captureFetch((rec) => {
+    sawAuth = rec.headers?.Authorization ?? null;
+    return openAiJson("ok");
+  });
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "pollinations/gpt-oss-20b", messages: [{ role: "user", content: "hi" }] })
+    }),
+    {},
+    {}
+  );
+  assert.equal(r.status, 200);
+  assert.equal(sawAuth, null, "免密钥 provider 不能带 Authorization，否则会被上游当无效凭据拒掉");
+});
+
+test("默认模型是免密钥的 —— 不传 model 时零配置可用", async () => {
+  const calls = captureFetch((rec) => {
+    assert.ok(rec.url.includes("pollinations"), `默认模型该走免密钥 provider，实际打了 ${rec.url}`);
+    return openAiJson("默认回答");
+  });
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] })
+    }),
+    {},
+    {}
+  );
+  assert.equal(r.status, 200);
+  assert.equal((await r.json()).choices[0].message.content, "默认回答");
+  assert.equal(calls.length, 1);
+});
+
+test("/v1/models 里免密钥 provider 的报告为可用", async () => {
+  captureFetch(() => jsonResp({}));
+  const r = await worker.fetch(new Request("https://x/v1/models"), {}, {});
+  assert.equal(r.status, 200);
+  const { data } = await r.json();
+  const p = data.find((m) => m.id === "pollinations/gpt-oss-20b");
+  assert.ok(p, "免密钥模型必须在列表里");
+  assert.equal(p.available, true, "零配置时免密钥模型应该报告可用");
+});
+
+test("/health 报告免密钥 provider 列表与默认模型", async () => {
+  const r = await worker.fetch(new Request("https://x/health"), {}, {});
+  const o = await r.json();
+  assert.deepEqual(o.providers_keyless, ["pollinations"]);
+  assert.equal(o.default_model, "pollinations/gpt-oss-20b");
+});
+
+test("配了 KV 但账号池是空的：提示指向「加账号」，而不是含糊的 502", async () => {
+  // 两种「没有凭据」要分清楚，否则用户会去翻自己明明配过的密钥。
+  const calls = captureFetch(() => jsonResp({}));
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "qwen/qwen3-coder-flash", messages: [{ role: "user", content: "hi" }] })
+    }),
+    { ACCOUNTS: fakeKv() },
+    {}
+  );
+  // 池子空 → callUpstream 直接抛 no_qwen_account，不会真的打上游
+  assert.equal(calls.length, 0, "池子空时不该白打上游");
+  const msg = (await r.json()).error.message;
+  assert.ok(/账号/.test(msg), `错误信息该指向「加账号」：${msg}`);
 });
 
 test("有效 token 的 Qwen 账号能用，且不触发 refresh", async () => {
@@ -1003,4 +1183,422 @@ test("上游返回非 JSON 时给 502，而不是抛未捕获异常", async () =
   );
   assert.ok(r.status >= 400, `期望报错，实际 ${r.status}`);
   assert.equal(typeof (await r.json()).error, "object");
+});
+
+// ============================================================
+// 15. 客户端要流式、上游给了普通 JSON（「转圈转到天荒地老」）
+// ============================================================
+//
+// 现象：客户端发 stream:true，某个上游忽略了这个字段，回 200 + application/json。
+// 旧实现不做任何 Content-Type 检查，直接把它当流透传：客户端收到 200 +
+// text/event-stream，内容却是一坨没有 data: 前缀的 JSON，也没有 [DONE]。
+// 表现是 UI 一直转圈，而上游和我们自己都是 200，日志里看不出任何异常。
+// 现在必须降级成非流式，并把降级行为显式标出来。
+
+test("上游无视 stream:true 返回 JSON 时，降级为非流式而不是让客户端转圈", async () => {
+  // 用 Qwen（不需要静态密钥）并把候选链限制在它的一个模型上：
+  // 否则调用方会带着「这次降级」的记分继续试下一个 provider，
+  // 测到的就不是「单一上游违约」这个场景了。
+  const calls = captureFetch((rec) => openAiJson("完整回答", {}, rec.body.model));
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "qwen/qwen3-coder-flash",
+        stream: true,
+        messages: [{ role: "user", content: "hi" }]
+      })
+    }),
+    { ACCOUNTS: fakeKv({ "acc:a": freshAccount() }) },
+    {}
+  );
+
+  // 关键：不能回 text/event-stream。回了它，客户端就会一直等 SSE 帧。
+  assert.ok(
+    !(r.headers.get("Content-Type") || "").includes("text/event-stream"),
+    "上游给的是 JSON，就不该对客户端宣称这是事件流"
+  );
+  const d = await r.json();
+  assert.equal(d.choices[0].message.content, "完整回答", "内容要完整交付，不能丢");
+  assert.equal(d._proxy.streamDowngraded, true, "降级必须显式标出来，不能静默");
+  assert.equal(r.headers.get("X-IceProxy-Stream-Downgraded"), "1");
+  // 上游确实收到过 stream:true —— 我们不改写客户端的意图，只是处理上游的违约
+  assert.equal(calls[0].body.stream, true);
+});
+
+test("上游老老实实返回 text/event-stream 时不触发降级", async () => {
+  captureFetch(() => sseResp(['data: {"choices":[{"delta":{"content":"A"}}]}\n\n']));
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "glm/glm-4.6-flash",
+        stream: true,
+        messages: [{ role: "user", content: "hi" }]
+      })
+    }),
+    { GLM_API_KEY: "k" },
+    {}
+  );
+  assert.ok((r.headers.get("Content-Type") || "").includes("text/event-stream"));
+  assert.equal(r.headers.get("X-IceProxy-Stream-Downgraded"), null);
+});
+
+test("Content-Type 带 charset 或大小写差异时仍认得出事件流", async () => {
+  // 真实上游五花八门：`text/event-stream; charset=utf-8`、`Text/Event-Stream`。
+  // 判定写得太平（用 === "text/event-stream"）就会把正常流误判成 JSON，
+  // 于是「流式回答」被整体降级 —— 这是个会静默劣化体验的坑。
+  for (const ctype of ["text/event-stream; charset=utf-8", "Text/Event-Stream", "TEXT/EVENT-STREAM"]) {
+    captureFetch(() => new Response('data: {"choices":[{"delta":{"content":"A"}}]}\n\n', {
+      status: 200,
+      headers: { "Content-Type": ctype }
+    }));
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "glm/glm-4.6-flash",
+          stream: true,
+          messages: [{ role: "user", content: "hi" }]
+        })
+      }),
+      { GLM_API_KEY: "k" },
+      {}
+    );
+    assert.ok(
+      (r.headers.get("Content-Type") || "").includes("text/event-stream"),
+      `${ctype} 应被识别为事件流`
+    );
+    assert.equal(r.headers.get("X-IceProxy-Stream-Downgraded"), null, `${ctype} 不该降级`);
+  }
+});
+
+// ============================================================
+// 16. 账号池读取次数（KV 是按读计费的）
+// ============================================================
+
+test("/v1/models 的可用性判断只 list 一次 KV，不对每个账号再 get", async () => {
+  let listCalls = 0;
+  let getCalls = 0;
+  const env = {
+    ACCOUNTS: {
+      list: async () => {
+        listCalls++;
+        return { keys: [{ name: "acc:a" }, { name: "acc:b" }, { name: "acc:c" }] };
+      },
+      get: async () => {
+        getCalls++;
+        return freshAccount();
+      },
+      put: async () => {},
+      delete: async () => {}
+    }
+  };
+  const r = await worker.fetch(new Request("https://x/v1/models"), env, {});
+  const d = await r.json();
+
+  assert.equal(listCalls, 1, "只该 list 一次");
+  assert.equal(getCalls, 0, "只关心数量，不该把每个账号都读一遍");
+  assert.equal(d.data.find((m) => m.id === "qwen/qwen3-coder-flash").available, true);
+});
+
+test("账号池读 KV 失败时按「没有账号」处理，而不是让 /v1/models 变 500", async () => {
+  const env = {
+    ACCOUNTS: {
+      list: async () => {
+        throw new Error("KV 抖动");
+      },
+      get: async () => null,
+      put: async () => {},
+      delete: async () => {}
+    }
+  };
+  const r = await worker.fetch(new Request("https://x/v1/models"), env, {});
+  assert.equal(r.status, 200, "KV 抖一下不该把整个模型列表打挂");
+  const d = await r.json();
+  assert.equal(d.data.find((m) => m.id === "qwen/qwen3-coder-flash").available, false);
+});
+
+test("accountCount=0 时不会因为「没有账号」把 Qwen 从候选链里摘掉", () => {
+  // 口径必须和 count() 的失败兜底一致：读不到账号数时不要替用户下结论，
+  // 交给上游去回答「这个 token 行不行」。否则一次 KV 抖动会让
+  // 配了账号的人看到 no_credentials。
+  // 现有实现把它排到了候选链末尾（其余 17 个模型都在它前面），而且
+  // 「一个 provider 都没有」时链是空的 —— 这里先把契约钉住，改动要显式改这条用例。
+  const chain = buildFallbackChain("qwen/qwen3-coder-flash", {}, 0);
+  assert.ok(chain.every((e) => e.prefix === "qwen"), "无密钥环境下只该留下 Qwen");
+  assert.ok(chain.some((e) => e.id === "qwen/qwen3-coder-flash"));
+});
+
+// ============================================================
+// 17. 回退时的响应头（客户端按头判断的那条路）
+// ============================================================
+//
+// 这一节是被端到端脚本逼出来的：单测里从没检查过这个头，
+// 而它实际有**两个**真问题。
+
+test("非流式回退也要带 X-IceProxy-Fallback 头，不能只在 body 里说", async () => {
+  // 旧实现只在流式那条路设这个头。客户端若按头判断是否发生了回退，
+  // 非流式场景会静默地把回退当正常响应。
+  captureFetch((rec) => {
+    if (rec.body.model.startsWith("llama-3.3")) {
+      return jsonResp({ error: { message: "rate limited" } }, 429);
+    }
+    return openAiJson("来自备用模型", {}, rec.body.model);
+  });
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "cerebras/llama-3.3-70b",
+        messages: [{ role: "user", content: "hi" }]
+      })
+    }),
+    { CEREBRAS_API_KEY: "k" },
+    {}
+  );
+  const d = await r.json();
+  assert.equal(d._proxy.fellBack, true, "该发生回退");
+  assert.ok(r.headers.get("X-IceProxy-Fallback"), "非流式也要有这个头");
+});
+
+test("回退头必须是 ASCII —— servedModel 里的箭头不能直接进 header", async () => {
+  // 这个是真炸过的：servedModel 为了可读用 `→`（U+2192），直接塞进
+  // new Response() 的 headers 会抛
+  //   TypeError: Cannot convert argument to a ByteString
+  // 一次正常的回退就这么变成了 500。HTTP 头只能是 latin-1/ASCII。
+  captureFetch((rec) => {
+    if (rec.body.model.startsWith("llama-3.3")) {
+      return jsonResp({ error: { message: "rate limited" } }, 429);
+    }
+    return openAiJson("来自备用模型", {}, rec.body.model);
+  });
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "cerebras/llama-3.3-70b",
+        messages: [{ role: "user", content: "hi" }]
+      })
+    }),
+    { CEREBRAS_API_KEY: "k" },
+    {}
+  );
+  // 构造响应本身没抛异常，就已经是这半个断言了
+  assert.equal(r.status, 200, "回退不该变成 500");
+  const header = r.headers.get("X-IceProxy-Fallback");
+  assert.ok(header, "回退必须能被客户端看见");
+  assert.ok(
+    [...header].every((ch) => ch.charCodeAt(0) <= 0xff),
+    `header 里有非 ASCII 字符：${JSON.stringify(header)}`
+  );
+  assert.ok(header.includes("->"), `箭头该被替换成 ->：${header}`);
+  // body 里保留可读版本，不影响日志/调试
+  const d = await r.json();
+  assert.ok(d._proxy.servedModel.includes("→"), "body 里仍用可读箭头");
+});
+
+test("流式回退的头同样是 ASCII", async () => {
+  captureFetch((rec) => {
+    if (rec.body.model.startsWith("llama-3.3")) {
+      return jsonResp({ error: { message: "rate limited" } }, 429);
+    }
+    return sseResp(['data: {"choices":[{"delta":{"content":"A"}}]}\n\n']);
+  });
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "cerebras/llama-3.3-70b",
+        stream: true,
+        messages: [{ role: "user", content: "hi" }]
+      })
+    }),
+    { CEREBRAS_API_KEY: "k" },
+    {}
+  );
+  assert.equal(r.status, 200);
+  const header = r.headers.get("X-IceProxy-Fallback");
+  assert.ok(header, "流式回退也要有这个头");
+  assert.ok([...header].every((ch) => ch.charCodeAt(0) <= 0xff), `非 ASCII：${header}`);
+});
+
+// ---------- 默认模型：环境变量必须真的生效 ----------
+//
+// `wrangler.toml` 里一直有个 `DEFAULT_MODEL` 变量，注释写着「想换默认模型
+// 改这里，不用改代码」—— 但代码从来没读过它。这类「改了没反应」的配置
+// 比没有配置更糟：用户会怀疑自己改错了文件，而不是怀疑代码。
+//
+// 在这里把它变成契约：不传 model 时，用谁由 env.DEFAULT_MODEL 决定。
+
+test("不传 model 时，默认模型来自 env.DEFAULT_MODEL", async () => {
+  const calls = captureFetch((rec) => openAiJson("ok", {}, rec.body.model));
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] })
+    }),
+    { GROQ_API_KEY: "k", DEFAULT_MODEL: "groq/qwen-3-32b" },
+    {}
+  );
+  assert.equal(r.status, 200);
+  const d = await r.json();
+  assert.equal(d._proxy.servedModel, "groq/qwen-3-32b");
+  assert.equal(calls[0].body.model, "qwen-3-32b", "发给上游的应该是剥掉前缀的模型名");
+});
+
+test("env.DEFAULT_MODEL 没写时，回退到编译期常量（行为不变）", async () => {
+  const calls = captureFetch((rec) => openAiJson("ok", {}, rec.body.model));
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] })
+    }),
+    {
+      ACCOUNTS: fakeKv({ "acc:a": freshAccount() }),
+      ...{ DEFAULT_MODEL: "" }
+    },
+    {}
+  );
+  assert.equal(r.status, 200);
+  assert.equal(calls[0].body.model, DEFAULT_MODEL.split("/").slice(1).join("/"));
+});
+
+test("env.DEFAULT_MODEL 写了非法值时，忽略它并回退（不能让 Worker 整个起不来）", async () => {
+  // 一个拼错的变量名不该导致所有请求都挂。宁可回退到已知可用的默认值 + 告警。
+  const warn = console.warn;
+  const warnings = [];
+  console.warn = (...a) => warnings.push(a.join(" "));
+  const calls = captureFetch((rec) => openAiJson("ok", {}, rec.body.model));
+  try {
+    const r = await worker.fetch(
+      new Request("https://x/v1/chat/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ messages: [{ role: "user", content: "hi" }] })
+      }),
+      { ACCOUNTS: fakeKv({ "acc:a": freshAccount() }), DEFAULT_MODEL: "nope/nope" },
+      {}
+    );
+    assert.equal(r.status, 200, "非法默认值不该让请求失败");
+    assert.equal(calls[0].body.model, DEFAULT_MODEL.split("/").slice(1).join("/"));
+  } finally {
+    console.warn = warn;
+  }
+  assert.ok(
+    warnings.some((w) => w.includes("nope/nope")),
+    `非法值必须告警，否则用户不知道自己的配置被忽略了。实际告警：${JSON.stringify(warnings)}`
+  );
+});
+
+// ---------- 上游回了非 JSON 的报文 ----------
+//
+// ⚠️ 先分清两条路，别测错地方：
+//
+//   A. 上游 ok=false（4xx/5xx）→ `handleChat` 在进入 makeJsonResponse **之前**
+//      就 `resp.text()` 记录进 `attempts`，然后换下一个候选。这条路一直没问题。
+//   B. 上游 **ok=true（200）但 body 不是 JSON** → 落到 `makeJsonResponse`，
+//      由 `readJsonOrText` 负责读出内容。**这条路才是本次修的地方。**
+//
+// 触发场景真实存在：网关或反代在 200 上回一个 HTML 续页/登录页
+// （公司网络门户、Cloudflare 的挑战页），或者上游把错误塞进了 200 的 HTML。
+// 旧实现是 `resp.json().catch(() => null)`，拿到 null 就丢一句
+// 「上游返回了非 JSON 内容」—— 把 body 里那段唯一有用的信息丢了。
+//
+// 这里还要防一个**测试自身的陷阱**：`Response` 的 body 是一次性的。
+// 如果复用同一个实例，第一次读成功之后后续读就永远拿不到内容，
+// 而断言用的是 `includes(...)`，很容易被前面的残留**假绿**。
+// 所以下面统一用工厂函数，每次给一个新实例。
+
+/** 上游 200，但 body 不是 JSON。每次调用给一个新 Response。 */
+const notJsonResp = (text, ctype = "text/html") => () =>
+  new Response(text, { status: 200, headers: { "Content-Type": ctype } });
+
+test("上游 200 但 body 是 HTML 时，错误里必须带上原文", async () => {
+  captureFetch(notJsonResp("<html><body>502 Bad Gateway</body></html>"));
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "glm/glm-4.6-flash", messages: [{ role: "user", content: "hi" }] })
+    }),
+    { GLM_API_KEY: "k" },
+    {}
+  );
+  const d = await r.json();
+  assert.ok(r.status >= 400, `期望报错，实际 ${r.status}`);
+  assert.equal(typeof d.error, "object", "错误体必须是 OpenAI 形状的对象");
+  assert.ok(
+    d.error.message.includes("502 Bad Gateway"),
+    `错误信息里必须保留上游原文，实际是：${d.error.message}`
+  );
+});
+
+test("上游 200 但 body 是纯文本时，错误里带上原文和内容类型", async () => {
+  captureFetch(notJsonResp("UNAVAILABLE: upstream refused", "text/plain"));
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "glm/glm-4.6-flash", messages: [{ role: "user", content: "hi" }] })
+    }),
+    { GLM_API_KEY: "k" },
+    {}
+  );
+  const d = await r.json();
+  assert.ok(
+    d.error.message.includes("upstream refused"),
+    `错误信息里必须保留上游原文，实际是：${d.error.message}`
+  );
+  assert.ok(
+    d.error.message.includes("text/plain"),
+    `错误信息里必须带上内容类型（否则不知道是谁回的东西），实际是：${d.error.message}`
+  );
+});
+
+test("上游 200 但 body 是 HTML —— Gemini 这条路同样要保留原文", async () => {
+  captureFetch(notJsonResp("<html>challenge required</html>"));
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "gemini/gemini-2.5-flash", messages: [{ role: "user", content: "hi" }] })
+    }),
+    { GEMINI_API_KEY: "k" },
+    {}
+  );
+  const d = await r.json();
+  assert.ok(
+    d.error.message.includes("challenge required"),
+    `Gemini 路径也必须保留原文，实际是：${d.error.message}`
+  );
+});
+
+test("上游 4xx/5xx 且 body 是纯文本时，原文也要进 attempts（这条路一直在，别回归）", async () => {
+  // 这条守的是「另一条路」：ok=false 时在 handleChat 里就记录了原文。
+  // 之前它只是顺带被 `includes` 覆盖到，这里把它变成显式契约。
+  captureFetch(() => new Response("error code: 1009", { status: 403, headers: { "Content-Type": "text/plain" } }));
+  const r = await worker.fetch(
+    new Request("https://x/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model: "cerebras/qwen-3-32b", messages: [{ role: "user", content: "hi" }] })
+    }),
+    { CEREBRAS_API_KEY: "k" },
+    {}
+  );
+  const d = await r.json();
+  assert.ok(
+    d.error.message.includes("1009"),
+    `上游原文没进错误信息，实际是：${d.error.message}`
+  );
+  assert.ok(d.error.message.includes("403"), `状态码没进错误信息：${d.error.message}`);
 });

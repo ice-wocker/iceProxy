@@ -62,6 +62,28 @@ export const PROVIDERS = {
     auth: "key",
     keyEnv: "GROQ_API_KEY",
     homepage: "https://console.groq.com/keys"
+  },
+  /**
+   * Pollinations —— 唯一一个 `auth: "none"` 的 provider：**不需要任何密钥**。
+   *
+   * 它存在的意义就是让「fork 完直接能用」这句话成立。之前所有 provider
+   * 都要么要静态密钥（gemini/glm/cerebras/groq/openrouter），要么要在 KV 里
+   * 存一个 OAuth 账号（qwen）—— 也就是说，**刚部署完的 iceProxy 一个模型都跑不通**，
+   * 必须先做一轮配置。这与「零配置反向代理」的定位是矛盾的。
+   *
+   * 匿名档是官方支持的档位（`tier: "anonymous"`），官方还专门声明
+   * 「legacy text API 对已认证用户下线，匿名请求不受影响」。
+   *
+   * 代价要说清楚：匿名档有速率限制、模型只有这一个（gpt-oss-20b），
+   * 而且**不支持 tools**。想要更多模型/更高额度，配上面那几家的密钥即可，
+   * 它们会作为回退链的下一环自动接管。
+   */
+  pollinations: {
+    label: "Pollinations (无密钥)",
+    base: "https://text.pollinations.ai/openai",
+    protocol: "openai",
+    auth: "none",
+    homepage: "https://pollinations.ai"
   }
 };
 
@@ -73,7 +95,11 @@ export const PROVIDERS = {
  * —— 写死了迟早过期，而 README 里写过期数字正是上一版的教训。
  */
 export const MODELS = [
-  // ---- Qwen（OAuth，多账号轮换，唯一不需要密钥的 provider）----
+  // ---- Pollinations（无需任何密钥，开箱即用；默认模型就在这一档）----
+  { id: "pollinations/gpt-oss-20b", ctx: 131072, caps: ["stream"] },
+  { id: "pollinations/openai-fast", ctx: 131072, caps: ["stream"] },
+
+  // ---- Qwen（OAuth 设备流，需要账号但不需要静态密钥）----
   { id: "qwen/qwen3-coder-flash", ctx: 1000000, caps: ["tools", "stream"] },
   { id: "qwen/qwen3-coder-plus", ctx: 1000000, caps: ["tools", "stream"] },
   { id: "qwen/qwen3-max", ctx: 262144, caps: ["tools", "stream"] },
@@ -107,8 +133,26 @@ export const MODELS = [
   { id: "openrouter/inclusionai/ling-3.0-flash-sante:free", ctx: 262144, caps: ["tools", "stream"] }
 ];
 
-/** 默认模型：挑个「不需要任何密钥就能跑」的，这样 fork 完直接可用。 */
-export const DEFAULT_MODEL = "qwen/qwen3-coder-flash";
+/**
+ * 编译期默认模型：挑个「不需要任何密钥就能跑」的，这样 fork 完直接可用。
+ * 运行期可以用 wrangler 的 `DEFAULT_MODEL` 变量覆盖（见 resolveDefaultModel）。
+ */
+export const DEFAULT_MODEL = "pollinations/gpt-oss-20b";
+
+/**
+ * 运行期的默认模型。
+ *
+ * 为什么要有这个函数：`wrangler.toml` 里一直有个 `DEFAULT_MODEL` 变量，
+ * 注释还写着「想换默认模型改这里，不用改代码」—— 但**代码从来没读过它**。
+ * 一个不生效的配置比没有配置更糟：用户改了、重启了、发现没变，然后开始
+ * 怀疑自己改错了文件。
+ *
+ * 三条规则：
+ *   1. env 里没写 / 空串 → 用编译期常量（默认行为不变）
+ *   2. env 里写了且在目录里 → 用它
+ *   3. env 里写了但**不在目录里** → 忽略并告警。不抛异常是刻意的：
+ *      一个拼错的变量不该让整个 Worker 起不来，所有请求都挂。
+ */
 
 /** 把 MODELS 展开成 id -> {provider, modelId, upstreamBase, ...} 的查找表。 */
 export function buildCatalog() {
@@ -135,6 +179,17 @@ export function buildCatalog() {
   return catalog;
 }
 
+/**
+ * 这个 id 在不在目录里？
+ *
+ * 刻意**不用模块级共享的 catalog 实例**：worker 自己持有一份（`worker.js`
+ * 顶部 `const catalog = buildCatalog()`），这里再导出一份就意味着两处状态。
+ * 目录是静态数据，重建一次的成本可以忽略，换来的是「只有一份真相」。
+ */
+export function isKnownModel(id) {
+  return MODELS.some((m) => m.id === id);
+}
+
 /** 按 provider 前缀分组，用于 /v1/models 的 owned_by 与文档生成。 */
 export function groupByProvider() {
   const out = new Map();
@@ -144,4 +199,16 @@ export function groupByProvider() {
     out.get(prefix).push(m);
   }
   return out;
+}
+
+export function resolveDefaultModel(env) {
+  const configured = env?.DEFAULT_MODEL;
+  if (typeof configured !== "string" || !configured.trim()) return DEFAULT_MODEL;
+  const id = configured.trim();
+  if (isKnownModel(id)) return id;
+  console.warn(
+    `env.DEFAULT_MODEL="${id}" 不在模型目录里，已忽略并回退到 ${DEFAULT_MODEL}。` +
+      `可用值见 src/providers.js 的 MODELS。`
+  );
+  return DEFAULT_MODEL;
 }

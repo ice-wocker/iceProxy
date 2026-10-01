@@ -1,6 +1,7 @@
 version: 2
 updates:
-  # 运行时依赖为空，但 devDependencies 里的 wrangler 需要跟进
+  # 运行时依赖为空，但 devDependencies 里的 wrangler 是部署工具链，
+  # 安全补丁和大版本都要跟 —— 它每周都在发版
   - package-ecosystem: npm
     directory: "/"
     schedule:

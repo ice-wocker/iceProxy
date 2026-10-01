@@ -16,6 +16,7 @@ import {
   PROVIDERS,
   MODELS,
   DEFAULT_MODEL,
+  resolveDefaultModel,
   buildCatalog
 } from "./providers.js";
 import {
@@ -28,7 +29,9 @@ import {
   iterGeminiDeltas,
   iterOpenAiDeltas,
   resolveApiKey,
-  classifyStatus
+  providerNeedsKey,
+  classifyStatus,
+  readJsonOrText
 } from "./adapters.js";
 import {
   corsHeaders,
@@ -79,7 +82,9 @@ function timingSafeEqual(a, b) {
 
 function handleHealth(env) {
   const configured = new Set();
-  for (const p of Object.values(PROVIDERS)) {
+  const keyless = [];
+  for (const [prefix, p] of Object.entries(PROVIDERS)) {
+    if (p.auth === "none") keyless.push(prefix);
     if (p.auth === "key" && env?.[p.keyEnv]) configured.add(p.keyEnv);
   }
   return ok({
@@ -88,6 +93,9 @@ function handleHealth(env) {
     models: MODELS.length,
     // 只报「哪些密钥已配置」，不回显值
     providers_ready: [...configured],
+    // 免密钥 provider：没有任何配置也应该能用
+    providers_keyless: keyless,
+    default_model: resolveDefaultModel(env),
     qwen_pool: !!env?.ACCOUNTS
   });
 }
@@ -99,14 +107,9 @@ function handleHealth(env) {
  * 标准客户端会忽略它们，而需要判断上下文的客户端能用上。
  */
 async function handleModels(env, pool) {
-  let accountCount = 0;
-  if (pool?.enabled) {
-    try {
-      accountCount = (await pool.list()).length;
-    } catch {
-      accountCount = 0;
-    }
-  }
+  // 只要「多少个账号」，所以用 count()：一次 KV list。
+  // 旧写法 list() 之后在循环里对每个账号再 get()，而那些值只被 .length 用掉。
+  const accountCount = await pool.count();
   const data = MODELS.map((m) => {
     const entry = catalog.get(m.id);
     const ready = isProviderReady(entry.provider, env, accountCount);
@@ -126,6 +129,7 @@ async function handleModels(env, pool) {
 }
 
 function isProviderReady(provider, env, accountCount) {
+  if (provider.auth === "none") return true; // 不需要凭据，永远可用
   if (provider.auth === "qwen-oauth") return accountCount > 0;
   return !!resolveApiKey(provider, env);
 }
@@ -133,14 +137,48 @@ function isProviderReady(provider, env, accountCount) {
 // ---------- 单次上游调用 ----------
 
 /**
- * 发起一次上游请求，返回原始 Response。
+ * 请求上游的超时上限（毫秒）。
+ *
+ * 只用在**非流式**请求上：上游收了请求却不回应时，Workers 会一直挂着，
+ * 客户端也只有干等的份。流式请求不能套总时长上限 —— 模型先思考 90 秒
+ * 再开始吐字是正常的，掐掉等于把长回答全废了。流式的活性判断见
+ * assertStreamingResponse 的注释。
+ */
+export const UPSTREAM_TIMEOUT_MS = 60_000;
+
+/**
+ * 同一个 provider 的重试次数与退避。
+ *
+ * 为什么需要：免费上游会**成片地**抽风 —— 实测 pollinations 会出现
+ * `ENOSPC: no space left on device`（它自己磁盘满了）和整段的 402。
+ * 隔一秒再试往往就好了。不给重试的话，一次瞬时抖动就会让候选链白白烧掉
+ * 一个名额（候选链最多 4 个，烧不起）。
+ *
+ * 只对**临时性**错误重试（见 isTransient）；400 这种「请求本身错了」
+ * 不重试，试一万次也是一样。
+ */
+const UPSTREAM_RETRIES = 1;
+const UPSTREAM_RETRY_DELAY_MS = 250;
+
+/**
+ * 发起一次上游请求，返回 { resp, ... }。
  *
  * 这里**不再改写 stream 字段** —— 客户端要流式就传流式，要非流式就传非流式。
  * 上一版在 openai-compat 分支硬编码 `stream: false`，是「流式请求收到
  * 非流式响应」这个 bug 的根因。
+ *
+ * 流式调用方**必须**再调 assertStreamingResponse(resp)：上游可能无视
+ * `stream: true` 直接回一个普通 JSON。
  */
 async function callUpstream({ entry, body, env, pool, stream }) {
   const { provider, upstreamModel } = entry;
+  const timeout = stream ? null : UPSTREAM_TIMEOUT_MS;
+  const init = (headers, payload) => ({
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json", ...headers },
+    body: JSON.stringify(payload),
+    ...(timeout ? { signal: AbortSignal.timeout(timeout) } : {})
+  });
 
   if (provider.auth === "qwen-oauth") {
     const acc = await pool.pick();
@@ -156,14 +194,10 @@ async function callUpstream({ entry, body, env, pool, stream }) {
       }
     }
     const upstream = { ...body, model: upstreamModel, stream };
-    const resp = await fetch(`${provider.base}/chat/completions`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${account.access_token}`
-      },
-      body: JSON.stringify(upstream)
-    });
+    const resp = await fetch(
+      `${provider.base}/chat/completions`,
+      init({ Authorization: `Bearer ${account.access_token}` }, upstream)
+    );
     return { resp, accountId, account };
   }
 
@@ -175,30 +209,53 @@ async function callUpstream({ entry, body, env, pool, stream }) {
     const suffix = stream ? "&alt=sse" : "";
     const resp = await fetch(
       `${provider.base}/models/${upstreamModel}:${method}?key=${encodeURIComponent(key)}${suffix}`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload)
-      }
+      init({}, payload)
     );
     return { resp, gemini: true };
   }
 
-  // openai 兼容：GLM / Cerebras / Groq / OpenRouter
+  // openai 兼容：GLM / Cerebras / Groq / OpenRouter + 免密钥的 Pollinations
   const key = resolveApiKey(provider, env);
-  if (!key) throw new AuthFailure(`missing_key:${provider.keyEnv}`);
+  if (providerNeedsKey(provider) && !key) {
+    throw new AuthFailure(`missing_key:${provider.keyEnv}`);
+  }
   const upstream = { ...body, model: upstreamModel, stream };
   delete upstream.provider;
-  const resp = await fetch(`${provider.base}/chat/completions`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${key}`,
-      ...(provider.extraHeaders || {})
-    },
-    body: JSON.stringify(upstream)
-  });
+  // 免密钥 provider 不带 Authorization 头 —— 带了反而会被上游当成无效凭据拒掉
+  const authHeader = key ? { Authorization: `Bearer ${key}` } : {};
+  const resp = await fetch(
+    `${provider.base}/chat/completions`,
+    init({ ...authHeader, ...(provider.extraHeaders || {}) }, upstream)
+  );
   return { resp };
+}
+
+class NonStreamingUpstreamError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "NonStreamingUpstreamError";
+  }
+}
+
+/**
+ * 「我要的是流，上游却给了普通 JSON」——调用方据此改成非流式交付。
+ *
+ * 症状（修之前）：客户端发 `stream: true`，某个上游因为自身策略无视了这个字段，
+ * 回 200 + `application/json`。旧代码不做任何检查，直接把它套进
+ * makeStreamResponse：客户端收到 200 + `text/event-stream`，然后是一坨
+ * 没有 `data:` 前缀的 JSON 文本，也没有 `[DONE]`。表现就是**界面一直转圈**，
+ * 而日志里什么都看不出来 —— 上游是 200，我们也是 200。
+ *
+ * 现在：返回一个错误对象表示「需要降级」，由调用方切换成非流式路径，
+ * 并在响应里带上 `_proxy.streamDowngraded` + `X-IceProxy-Stream-Downgraded`。
+ * 客户端至少能立刻拿到完整回答，而不是等一个永远不会来的帧。
+ */
+function assertStreamingResponse(resp) {
+  const ctype = (resp.headers.get("Content-Type") || "").toLowerCase();
+  if (ctype.includes("text/event-stream")) return null;
+  return new NonStreamingUpstreamError(
+    `上游没有返回事件流（Content-Type: ${ctype || "未声明"}），已按非流式交付`
+  );
 }
 
 /** 从请求体里挑出该转发给上游的字段，避免把客户端私有字段透传过去。 */
@@ -246,40 +303,119 @@ export function buildUpstreamBody(body) {
 export function buildFallbackChain(modelId, env, accountCount) {
   const primary = catalog.get(modelId);
   if (!primary) return [];
-  // 主模型自身也要检查凭据：否则「没配任何密钥」会得到一个非空候选链，
+
+  // 「这个 provider 现在能试吗」有三种答案，不能压成两种：
+  //   ready  确定能用（静态密钥配了，或 Qwen 账号数 > 0）
+  //   maybe  说不清 —— Qwen 有 KV binding 但账号数读出来是 0，
+  //          分不清「真没账号」还是「KV 刚抖动 / list 失败」
+  //   no     确定不能用（静态密钥没配）
+  //
+  // maybe 必须单独对待：**不摘掉它**（一次 KV 抖动不该让配了账号的人看到
+  // 「你没配凭据」），但**也不让它排在确定能用的 provider 前面** ——
+  // 否则一个空账号池会永远占着第一顺位白试一次，把真正配好的 provider
+  // 挤出 4 次尝试的窗口。
+  const readiness = (p) => {
+    if (p.auth === "none") return "ready"; // 免密钥，天然就绪
+    if (p.auth === "qwen-oauth") return accountCount > 0 ? "ready" : "maybe";
+    return isProviderReady(p, env, accountCount) ? "ready" : "no";
+  };
+  const allowed = (p) => readiness(p) !== "no";
+
+  // 主模型自身也要检查凭据：否则「一个密钥都没配」会得到一个非空候选链，
   // 一路试到最后一个 provider 才报错，错误信息也说不清到底缺什么。
-  const chain = isProviderReady(primary.provider, env, accountCount) ? [primary] : [];
+  const chain = allowed(primary.provider) ? [primary] : [];
   const seen = new Set([modelId]);
 
   for (const m of MODELS) {
     const e = catalog.get(m.id);
     if (seen.has(m.id)) continue;
-    if (e.prefix === primary.prefix && isProviderReady(e.provider, env, accountCount)) {
+    // 同 provider 的其它模型紧跟 primary：同一份凭据，最便宜的一次重试，
+    // 不该被别的 provider 插队。
+    if (e.prefix === primary.prefix && allowed(e.provider)) {
       seen.add(m.id);
       chain.push(e);
     }
   }
+
+  // 其它 provider：确定能用的先上，maybe 的垫底。
+  const others = [];
   for (const m of MODELS) {
     const e = catalog.get(m.id);
-    if (seen.has(m.id)) continue;
-    if (e.prefix !== primary.prefix && isProviderReady(e.provider, env, accountCount)) {
-      seen.add(m.id);
-      chain.push(e);
-    }
+    if (seen.has(m.id) || e.prefix === primary.prefix || !allowed(e.provider)) continue;
+    seen.add(m.id);
+    others.push(e);
   }
+  others.sort((a, b) => (readiness(a.provider) === "ready" ? 0 : 1) - (readiness(b.provider) === "ready" ? 0 : 1));
+  for (const e of others) if (!chain.some((c) => c.id === e.id)) chain.push(e);
+
   return chain.slice(0, 4); // 别无限重试，用户等不起
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 这个失败值得**原地重试同一个 provider**吗？
+ *
+ * 和 isRetryable 的区别是刻意的，别合并：
+ *   - 429（限流）：额度已经用完了，250ms 后再打还是 429。该换 provider。
+ *   - 401/403（认证）：凭据错了，重试一万次也一样。该换 provider。
+ *   - 402：免费额度耗尽/参数要付费。同样该换。
+ *   - 5xx / 408 / 425：上游瞬时抽风（实测 pollinations 的 ENOSPC 就是 500）。
+ *     这才是「等一下就好」的情况，值得原地重试一次。
+ *   - 网络层异常（超时、连接被切）：同上，值得重试。
+ */
+function isTransient(status) {
+  return status === 408 || status === 425 || status >= 500;
 }
 
 /** 这个状态码值得换个 provider 再试吗？ */
 function isRetryable(status) {
-  return status === 429 || status === 401 || status === 403 || status >= 500;
+  // 402/408/425 也归进来。它们看着像「客户端的错」，其实是上游的临时状态：
+  //   - 402 Payment Required：免费档额度用尽 / 这个模型或参数要付费。
+  //     实测 pollinations 对 `tools`、`system` 角色、以及偶发抽风都回 402 ——
+  //     换个 provider 完全可能成功，所以必须回退，不能当硬错误丢给用户。
+  //   - 408 请求超时、425 Too Early：重试有意义的临时状态。
+  return (
+    status === 402 ||
+    status === 408 ||
+    status === 425 ||
+    status === 429 ||
+    status === 401 ||
+    status === 403 ||
+    status >= 500
+  );
+}
+
+/**
+ * 上游回 200，但 body 里没有任何可用的回答吗？
+ *
+ * 为什么需要：真实上游会**偶发**回一个空 `{}` —— HTTP 200、Content-Type 正常，
+ * 但既没有 choices 也没有 error（实测 pollinations 会出现）。假上游永远不会
+ * 这样，所以单测和离线 e2e 都照不到。
+ *
+ * 旧行为是原样透传成 `choices: []`，客户端拿到「成功但没有内容」，只能自己猜。
+ * 现在把它当成一次失败，继续走候选链 —— 下一个 provider 往往是好的。
+ *
+ * 只用于**非流式**：流式判断「有没有内容」要读完整个流，破坏实时性，不值得。
+ */
+export function isEmptyCompletion(d) {
+  if (!d || typeof d !== "object") return true;
+  if (d.error) return false; // 有 error 就交给错误路径，别在这里吞
+  if (!Array.isArray(d.choices) || d.choices.length === 0) return true;
+  const c = d.choices[0];
+  const content = c?.message?.content ?? c?.text ?? "";
+  const hasToolCall = Array.isArray(c?.message?.tool_calls) && c.message.tool_calls.length > 0;
+  return !String(content).trim() && !hasToolCall;
 }
 
 // ---------- 主处理 ----------
 
 async function handleChat(rawBody, env, pool, wantStream) {
   const body = buildUpstreamBody(rawBody);
-  const requested = rawBody.model || DEFAULT_MODEL;
+  // 客户端没指定 model 时用环境变量里的默认模型（wrangler.toml 的 DEFAULT_MODEL）。
+  // 在这之前那个变量是死的 —— 声明了、注释也写了「改这里就能换默认模型」，
+  // 但代码从没读过，属于「改了没反应还找不到原因」的那类配置。
+  const requested = rawBody.model || resolveDefaultModel(env);
 
   if (!catalog.has(requested)) {
     const available = MODELS.map((m) => m.id).join(", ");
@@ -292,14 +428,7 @@ async function handleChat(rawBody, env, pool, wantStream) {
     return errorResponse("messages 不能为空", { param: "messages" });
   }
 
-  let accountCount = 0;
-  if (pool?.enabled) {
-    try {
-      accountCount = (await pool.list()).length;
-    } catch {
-      accountCount = 0;
-    }
-  }
+  const accountCount = await pool.count();
 
   const chain = buildFallbackChain(requested, env, accountCount);
   if (!chain.length) {
@@ -310,17 +439,47 @@ async function handleChat(rawBody, env, pool, wantStream) {
   }
 
   const attempts = [];
+  // 有多少次失败是「凭据缺失」造成的。全是的话，报错该指向「去配凭据」，
+  // 而不是丢一句 502 —— 502 听起来像上游挂了，用户会去查网络。
+  let credentialErrors = 0;
   for (const entry of chain) {
     let out;
-    try {
-      out = await callUpstream({ entry, body, env, pool, stream: wantStream });
-    } catch (e) {
+    // 对同一个 provider 做有限重试：临时抖动（上游磁盘满、边缘 5xx）
+    // 隔一下再试通常就好，比直接换 provider 更省额度。
+    for (let attempt = 0; attempt <= UPSTREAM_RETRIES; attempt++) {
+      try {
+        out = await callUpstream({ entry, body, env, pool, stream: wantStream });
+      } catch (e) {
+        out = { error: e };
+      }
+      // 网络层就抛了（超时/连接断）—— 值得原地重试
+      if (out?.error) {
+        const e = out.error;
+        if (e instanceof AuthFailure) break; // 凭据问题，重试无意义
+        if (attempt < UPSTREAM_RETRIES) {
+          await sleep(UPSTREAM_RETRY_DELAY_MS);
+          continue;
+        }
+        break;
+      }
+      if (isTransient(out.resp.status) && attempt < UPSTREAM_RETRIES) {
+        await sleep(UPSTREAM_RETRY_DELAY_MS);
+        continue;
+      }
+      break;
+    }
+
+    // 调用阶段就失败了（没拿到 Response）：区分「凭据缺失」和「真出错」。
+    if (out?.error) {
+      const e = out.error;
       if (e instanceof AuthFailure && e.message.startsWith("missing_key:")) {
         attempts.push({ model: entry.id, error: `缺少密钥 ${e.message.split(":")[1]}` });
+        credentialErrors++;
         continue;
       }
       if (e instanceof AuthFailure && e.message === "no_qwen_account") {
         attempts.push({ model: entry.id, error: "没有可用的 Qwen 账号" });
+        credentialErrors++;
         continue;
       }
       attempts.push({ model: entry.id, error: e.message });
@@ -350,33 +509,91 @@ async function handleChat(rawBody, env, pool, wantStream) {
     const meta = { servedModel, fellBack: entry.id !== requested, attempts };
 
     if (wantStream) {
-      return makeStreamResponse({ entry, resp, model: requested, meta });
+      const downgrade = assertStreamingResponse(resp);
+      if (!downgrade) {
+        return makeStreamResponse({ entry, resp, model: requested, meta });
+      }
+      // 上游不听「stream: true」。降级但不静默：响应体照旧是合法 JSON，
+      // 另外把这件事写进 _proxy 和响应头。
+      attempts.push({ model: entry.id, error: downgrade.message });
+      meta.streamDowngraded = true;
+      return makeJsonResponse({
+        entry,
+        resp,
+        model: requested,
+        meta,
+        headers: { "X-IceProxy-Stream-Downgraded": "1" }
+      });
     }
-    return makeJsonResponse({ entry, resp, model: requested, meta });
+    // 非流式：先读一次 body，挡掉「200 但空完成」这种偶发情况并继续回退。
+    // 只为**OpenAI 协议**的 provider 做这个判断 —— Gemini 的 JSON 里是
+    // `candidates` 而不是 `choices`，拿 isEmptyCompletion 去量它必然误判为空。
+    // 读出来的解析结果原样传给 makeJsonResponse，不重复读 body。
+    const peeked = await readJsonOrText(resp);
+    const openaiShape = entry.provider.protocol !== "gemini";
+    if (openaiShape && !peeked._nonJson && isEmptyCompletion(peeked)) {
+      attempts.push({ model: entry.id, error: "上游返回了空的完成（HTTP 200 但无内容）" });
+      continue;
+    }
+    return makeJsonResponse({ entry, resp, peeked, model: requested, meta });
   }
 
   const detail = attempts.map((a) => `${a.model}: ${a.error}`).join(" | ");
+  if (attempts.length && credentialErrors === attempts.length) {
+    return errorResponse(
+      `没有可用于 ${requested} 的凭据。请配置对应 provider 的密钥，或用 node scripts/auth.js add 添加 Qwen 账号。`,
+      { status: 400, type: "invalid_request_error", code: "no_credentials" }
+    );
+  }
   return upstreamError(`所有候选 provider 都失败了。${detail}`);
 }
 
-async function makeJsonResponse({ entry, resp, model, meta }) {
+/**
+ * 回退信息要同时出现在 body 的 `_proxy` 和响应头上（README 承诺了后者）。
+ *
+ * 两个坑，都是这套代码真踩过的：
+ *   1. **头部值只能是 ASCII（ByteString）。** `servedModel` 为了可读用了
+ *      `→`（U+2192），直接塞进 header 会让 `new Response()` 抛
+ *      「Cannot convert argument to a ByteString」—— 一次正常的回退直接变成 500。
+ *      header 用 ASCII 的 `->`，可读性交给 body 里的 `_proxy`。
+ *   2. **非流式那条路以前完全不设这个头**，只在 body 里说。客户端若按头判断，
+ *      非流式场景会把回退当正常响应。
+ */
+function fallbackHeaders(meta) {
+  if (!meta?.fellBack) return {};
+  return { "X-IceProxy-Fallback": String(meta.servedModel).replace(/[^\x20-\x7e]/g, "->") };
+}
+
+async function makeJsonResponse({ entry, resp, peeked = null, model, meta, headers = {} }) {
   const id = completionId();
   const created = Math.floor(Date.now() / 1000);
+  headers = { ...fallbackHeaders(meta), ...headers };
 
   // Gemini 需要翻译形状，OpenAI 兼容的直接透传
   if (entry.provider.protocol === "gemini") {
-    const d = await resp.json().catch(() => null);
-    if (!d) return upstreamError("上游返回了非 JSON 内容");
+    const d = peeked ?? (await readJsonOrText(resp));
+    if (d._nonJson) {
+      return upstreamError(`上游返回了非 JSON 内容（HTTP ${resp.status}，${resp.headers.get("Content-Type") || "未声明类型"}）：${d.text}`);
+    }
     if (d.error) return upstreamError(d.error.message || JSON.stringify(d.error), 502);
     const { text, usage, finishReason } = fromGeminiResponse(d, model);
-    return ok({
-      ...requireOpenaiShape({ id, created, model, content: text, usage, finishReason }),
-      _proxy: meta
-    });
+    return ok(
+      {
+        ...requireOpenaiShape({ id, created, model, content: text, usage, finishReason }),
+        _proxy: meta
+      },
+      headers
+    );
   }
 
-  const d = await resp.json().catch(() => null);
-  if (!d) return upstreamError("上游返回了非 JSON 内容");
+  const d = peeked ?? (await readJsonOrText(resp));
+  if (d._nonJson) {
+    // 网关/边缘节点拒绝时回的是纯文本（例如 GFW 的 RST、Cloudflare 的 1009），
+    // 那段文本本身就是最有用的诊断，别丢。
+    return upstreamError(
+      `上游返回了非 JSON 内容（HTTP ${resp.status}，${resp.headers.get("Content-Type") || "未声明类型"}）：${d.text}`
+    );
+  }
   if (d.error) return upstreamError(d.error.message || JSON.stringify(d.error), 502);
   // 上游的 usage/model 保持原样，只补上缺失的字段
   return ok({
@@ -396,7 +613,7 @@ async function makeJsonResponse({ entry, resp, model, meta }) {
     })),
     usage: d.usage ?? { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
     _proxy: meta
-  });
+  }, headers);
 }
 
 function requireOpenaiShape({ id, created, model, content, usage, finishReason }) {
@@ -455,9 +672,7 @@ async function makeStreamResponse({ entry, resp, model, meta }) {
     }
   });
 
-  const headers = {};
-  if (meta.fellBack) headers["X-IceProxy-Fallback"] = meta.servedModel;
-  return streamResponse(stream);
+  return streamResponse(stream, fallbackHeaders(meta));
 }
 
 // ---------- Qwen OAuth 设备流 ----------
@@ -513,6 +728,8 @@ export {
   MODELS,
   DEFAULT_MODEL,
   catalog,
+  assertStreamingResponse,
+  NonStreamingUpstreamError,
   corsHeaders,
   AccountPool,
   AuthFailure
@@ -621,23 +838,13 @@ async function handleAdminHealth(request, env, pool) {
   if (!timingSafeEqual(String(secret), provided)) {
     return errorResponse("无权访问", { status: 403, type: "permission_error" });
   }
-  const ids = await pool.list();
-  const accounts = [];
-  for (const id of ids) {
-    const acc = await pool.get(id);
-    accounts.push({
-      id,
-      has_token: !!acc?.access_token,
-      expires_in_min: acc?.expires_at
-        ? Math.max(0, Math.floor((acc.expires_at - Date.now() / 1000) / 60))
-        : 0,
-      cooling_down_until: acc?.cooldown_until ? new Date(acc.cooldown_until).toISOString() : null,
-      last_error: acc?.last_error ?? null
-    });
-  }
+  // 概览逻辑收进账号池：它更清楚「哪些字段能外泄」，别再散在路由层
+  const accounts = await pool.accounts();
+  const total = accounts.length;
   const providers = {};
   for (const [prefix, p] of Object.entries(PROVIDERS)) {
-    providers[prefix] = p.auth === "qwen-oauth" ? ids.length > 0 : !!resolveApiKey(p, env);
+    providers[prefix] =
+      p.auth === "none" ? true : p.auth === "qwen-oauth" ? total > 0 : !!resolveApiKey(p, env);
   }
-  return ok({ total: ids.length, accounts, providers });
+  return ok({ total, accounts, providers });
 }

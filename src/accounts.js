@@ -74,6 +74,51 @@ export class AccountPool {
     if (this.kv) await this.kv.delete("acc:" + id);
   }
 
+  /**
+   * 账号数量，只做一次 KV list。
+   *
+   * `/v1/models` 要对 18 个模型各判一次「这个 provider 现在可用吗」，
+   * 而 Qwen 的判据就是「账号池非空」。旧实现调 list() 之后**每个 id 再 get 一次**，
+   * 而那个结果只被当作 `.length` 用掉 —— 等于每次拉模型列表都白读十几二十次 KV。
+   * KV 有读配额，这种浪费是会被计费的。
+   *
+   * 失败时返回 0：宁可把「可用」显示成 false（客户端会去试下一个模型），
+   * 也不要让一次 KV 抖动把整个 /v1/models 变成 500。
+   * 这与 buildFallbackChain 里的口径一致：accountCount===0 时不因为账号问题跳过 Qwen。
+   */
+  async count() {
+    if (!this.kv) return 0;
+    try {
+      const res = await this.kv.list({ prefix: "acc:" });
+      return (res.keys ?? []).length;
+    } catch (e) {
+      console.warn("读取账号池失败，按 0 个账号处理", e?.message || e);
+      return 0;
+    }
+  }
+
+  /**
+   * 账号概览，给 `/admin/health` 用。**永不返回 token 明文** ——
+   * 只回答「有没有」「还有多久过期」「是不是在冷却」「上次错在哪」。
+   */
+  async accounts() {
+    if (!this.kv) return [];
+    const out = [];
+    for (const id of await this.list()) {
+      const acc = await this.get(id);
+      out.push({
+        id,
+        has_token: !!acc?.access_token,
+        expires_in_min: acc?.expires_at
+          ? Math.max(0, Math.floor((acc.expires_at - this.now() / 1000) / 60))
+          : 0,
+        cooling_down_until: acc?.cooldown_until ? new Date(acc.cooldown_until).toISOString() : null,
+        last_error: acc?.last_error ?? null
+      });
+    }
+    return out;
+  }
+
   // ---------- 可用性判断 ----------
 
   /**

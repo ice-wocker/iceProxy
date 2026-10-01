@@ -145,11 +145,23 @@ export async function* iterOpenAiDeltas(body) {
   }
 }
 
-/** 判断一个 provider 配置是否需要静态密钥，并取出它。 */
+/**
+ * 判断一个 provider 配置是否需要静态密钥，并取出它。
+ *
+ * 返回 `null` 有两种完全不同的含义，别混：
+ *   - `auth === "none"`：**不需要**密钥，这是正常状态（如 pollinations）
+ *   - `auth === "key"` 但环境里没配：需要密钥但缺失，是错误状态
+ * 调用方要区分它们，请用 `providerNeedsKey()`，不要只看这个返回值。
+ */
 export function resolveApiKey(provider, env) {
   if (provider.auth !== "key") return null;
   const key = env?.[provider.keyEnv];
   return key ? String(key).trim() : null;
+}
+
+/** 这个 provider 是否必须配密钥才能用。 */
+export function providerNeedsKey(provider) {
+  return provider?.auth === "key";
 }
 
 /** 上游 HTTP 状态 → 我们的失败原因分类，用于决定冷却时长。 */
@@ -160,4 +172,33 @@ export function classifyStatus(status) {
   return "server_error";
 }
 
-export { AuthFailure };
+/**
+ * 非流式的上游响应体可能**不是 JSON**。
+ *
+ * 为什么必须在读之前先看 Content-Type：网关/边缘节点拒掉请求时
+ * （GFW 的 RST、Cloudflare 的 1009、nginx 的 502 页）回的都是 HTML 或纯文本，
+ * 而且 Content-Type 常常是宣称不了的 `text/plain` / 缺失。
+ * 这些响应的 body 里**有诊断信息**（`error code: 1009` 一眼就能看出是被墙了）。
+ *
+ * ⚠️ 这里有个坑，值得写下来：**先 `resp.json()` 再落到 `resp.text()` 是拿不到东西的。**
+ * 实测（Node 24）：
+ *   const r = new Response("error code: 1009", {status:500});
+ *   await r.json().catch(() => null);   // null
+ *   await r.text();                     // throw: Body is unusable: Body has already been read
+ * 失败的 `json()` 会先 `discard()` 掉 body，于是后面的 `text()` 永远抛错、
+ * 被兜成空串 —— 「保留了原文」是假的，只是恰好没报错。
+ * 所以**必须先 `text()` 把原始字节拿到手，再自己 `JSON.parse`**。
+ * 顺序反过来，这个函数就是摆设。
+ *
+ * 实测（这些域名在容器里就是被拒的）：
+ *   api.cerebras.ai  → 403 `text/plain` `error code: 1009`
+ *   api.groq.com     → 403 `{"error":{"message":"Forbidden"}}`
+ */
+export async function readJsonOrText(resp) {
+  const raw = await resp.text().catch(() => "");
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return { _nonJson: true, text: raw.slice(0, 200) };
+  }
+}

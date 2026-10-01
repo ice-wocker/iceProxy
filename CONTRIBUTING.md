@@ -16,8 +16,26 @@
 跑：
 
 ```bash
-npm test
+npm run check      # 语法 + 单测 + 文档一致性 + 本地端到端（全程不出网）
+npm run probe      # 真的打上游一次，看模型名还在不在（唯一出网的检查）
 ```
+
+三层，缺一不可：
+
+- **`npm test`**（单测，零依赖、离线）测的是函数级契约；
+- **`scripts/verify-local.mjs`**（端到端）把 Worker 挂在一个本地假上游上，
+  用真实 HTTP 跑一遍客户端会走的路，看的是原始报文 —— 响应头、
+  分块边界、`[DONE]`。
+
+为什么必须有第二层：这个项目修掉的两个 bug（`X-IceProxy-Fallback` 只在流式
+路径上设、header 里的 `→` 让回退变成 500）**单测全绿、端到端第一次跑就炸**。
+函数返回值都对，错的是「发给客户端的那个报文」。凡是涉及响应头、
+报文形状、分块边界的东西，都要能在 `verify-local.mjs` 里看到一条断言。
+
+第三层（`npm run probe`）回答的是前两层**永远回答不了**的问题：
+**上游还认不认这个模型名。** 免费档会悄悄下线模型 ID，而这种腐坏在本地
+永远是绿的 —— 假上游只按你写的规则回话，它不会告诉你「这个 id 已经没了」。
+给 PR 加模型时，请把 `npm run probe -- --model <你的新模型>` 的结果贴上来。
 
 写测试时请遵守一条：**先确认你的测试在 bug 存在时会变红。**
 
@@ -68,6 +86,16 @@ npm test        # 恢复后必须全绿
    node scripts/check-docs.mjs   # 不一致会直接告诉你差在哪
    ```
 
+4. **真发一次请求确认它回话。** 上一步只证明「文档和代码一致」，
+   不证明「上游认这个名字」：
+
+   ```bash
+   node scripts/probe-models.mjs --model provider/your-new-model
+   ```
+
+   看到 `🔑` 说明是凭据问题（换个真 key 再试），看到 `✖` 才是模型名有问题。
+   **把结果贴进 PR 描述** —— 这是唯一能证明这个 id 存在的证据。
+
 ## 改协议相关的东西
 
 `src/openai.js`（SSE 帧与错误形状）和 `src/adapters.js`（各家协议转换）
@@ -77,14 +105,27 @@ npm test        # 恢复后必须全绿
   测试里有对应的用例，别删。
 - 错误体必须是 `{"error": {"message", "type", "code"}}` 对象。
 - 流式响应必须以字面量 `data: [DONE]` 收尾，否则客户端会一直等。
+- **`Response` 的 body 是一次性的，读法有顺序。** 想「先试 JSON、失败再拿文本」，
+  必须**先 `text()` 再自己 `JSON.parse`**。反过来写（`json()` 失败后调 `text()`）
+  会踩到：失败的 `json()` 已经 `discard()` 了 body，后面的 `text()` 抛
+  `Body is unusable`，被 `catch` 兜成空串 —— 代码看着在保留原文，
+  实际什么都没保留，而且**不报错**。3.1.0 第一版就是这么写的，
+  变异测试才发现。
 
 ## 提交前
 
 ```bash
-npm run check                  # 单测 + 语法检查
-node scripts/check-docs.mjs    # 文档与代码一致性
+npm run check                  # 语法 + 单测 + 文档一致性 + 端到端
 bash -n deploy.sh
 ```
+
+## 加一个新的「行为」
+
+`scripts/check-docs.mjs` 会校验「README 提到的行为在源码里有没有落点」。
+新增一个能写进 README 的行为时，往那张 `BEHAVIOR_ANCHORS` 表里加一条：
+一个 README 里会出现的说法（正则）、一两个实现符号。
+删功能时它会先红，提醒你同步文档 —— 上一版 README 描述了一个不存在的
+「跨 provider 自动故障转移」，就是这么飘掉的。
 
 ## 提交信息
 

@@ -12,16 +12,16 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 20 是 engine 下限，22 是当前 LTS。两条都测 ——
+        # 20 是 engines 的下限，22 是当前 LTS，24 是当前 stable。
         # 只在一条上绿过，就没资格说「支持多版本」。
-        node-version: ["20", "22"]
+        node-version: ["20", "22", "24"]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
 
-      # 单元测试零依赖（node:test + node:assert），所以不装 wrangler。
+      # 单元测试零依赖（node:test + node:assert），所以**不装 wrangler**。
       # 这本身是个需要守住的特性：装依赖会让 CI 变慢，也会引入供应链面。
       - name: 单元测试
         run: npm test
@@ -32,6 +32,19 @@ jobs:
             node --check "$f" || exit 1
           done
 
+  # 端到端：把 Worker 挂在一个本地假上游上，用真实 HTTP 请求过一遍
+  # 客户端会走的路。和单测分开，因为它要起端口、且验证的是「对客户端友好」
+  # （报文头、分块边界、[DONE]），不是函数返回值。
+  e2e-local:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: 本地假上游端到端冒烟
+        run: node scripts/verify-local.mjs
+
   docs-sync:
     runs-on: ubuntu-latest
     steps:
@@ -39,10 +52,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      # README 里列出的模型必须和代码里的目录一致。
-      # 上一版 README 写着「7 个模型」，代码里是 8 个，一个都对不上 ——
-      # 这条守的就是那个故障：文档与代码各自漂移。
-      - name: README 与 src/providers.js 的模型清单必须一致
+      # README 里列出的模型必须和代码里的目录一致，README 声称的行为
+      # 也必须在源码里有落点。上一版 README 写着「7 个模型」而代码里 8 个，
+      # 还写着「跨 provider 自动故障转移」而那个功能根本不存在 ——
+      # 文档漂移用眼睛是看不住的，交给 CI。
+      - name: README 与代码一致性
         run: node scripts/check-docs.mjs
 
   shellcheck:
@@ -54,3 +68,43 @@ jobs:
           bash -n deploy.sh
           sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
           shellcheck -S warning deploy.sh || true
+
+  # 真实可用性探测。
+  #
+  # 和上面几条的区别：上面全是「离线、用假上游、验我们的报文对不对」，
+  # 这条**真的出网**，验的是「上游还认不认这些模型名」。
+  # 免费档的模型 ID 会被下线，而这类失效在本地永远是绿的 —— 必须真打一次。
+  #
+  # 只跑 OpenRouter 一个 provider：
+  #   1. 它是唯一「只凭一个 key 就能验证一整排模型」且不绑定账号的；
+  #   2. CI 里没有 Qwen 账号池，也没有其它 provider 的密钥（也不该有）；
+  #   3. 探测**不需要真实 key** —— 无论 key 有效与否，OpenRouter 都会先回
+  #      401/403 告诉我们这个模型名存不存在。我们要的就是后者。
+  #
+  # ⚠️ 这一步失败**不阻断**（continue-on-error）：别人的免费档波动不该
+  # 让我们的 CI 变红。它产出的是诊断信息，真正的判断在人手里 ——
+  # 而且 `scripts/probe-models.mjs` 退出码永远是 0，这里显式写出来是为了
+  # 让「为什么不卡它」这件事有据可查。
+  probe-models:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: 探测 OpenRouter 免费档的模型名是否还在
+        env:
+          OPENROUTER_API_KEY: "probe-only-not-a-real-key"
+        run: node scripts/probe-models.mjs --json > probe.json || true
+      - name: 摘要
+        run: |
+          node -e "
+            const d = require('./probe.json');
+            const cred = d.results.filter((r) => r.reason === 'credentials');
+            const real = d.results.filter((r) => r.status === 'fail' && r.reason !== 'credentials');
+            console.log('未测', d.summary.skipped, '/ 可用', d.summary.ok, '/ 不可用', d.summary.fail);
+            console.log('其中凭据无效（不算模型下线）：', cred.length);
+            if (!cred.length) console.log('  🤔 一个凭据问题都没有？确认探测确实打到了上游。');
+            for (const b of real) console.log('  ⚠️ 需要人复核：' + b.id + ' —— ' + b.detail.slice(0, 200));
+          " 2>/dev/null || echo "（探测结果不可解析，看上面日志）"
