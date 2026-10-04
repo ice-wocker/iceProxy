@@ -8,6 +8,8 @@
   <img src="https://img.shields.io/github/stars/ice-wocker/iceProxy?style=social" alt="Stars">
 </p>
 
+[![CI](https://github.com/ice-wocker/iceProxy/actions/workflows/ci.yml/badge.svg)](https://github.com/ice-wocker/iceProxy/actions) [![Release](https://img.shields.io/github/v/release/ice-wocker/iceProxy)](https://github.com/ice-wocker/iceProxy/releases)
+
 <h1 align="center">iceProxy</h1>
 
 <p align="center">
@@ -365,6 +367,14 @@ turn, which is how OpenAI behaves. Streaming requests are proxied, not buffered.
 
 Cloudflare Workers and KV both have free tiers that comfortably cover personal use.
 Total: $0/month. See Cloudflare's current pricing for limits.
+
+## Comparison
+
+| 维度 | iceProxy | OpenRouter | LiteLLM |
+|---|---|---|---|
+| 免费额度 | 聚合 7 providers 的免费层，默认模型免密钥可用；免费配额经常变，具体数字以各家官网为准 | 提供部分免费层模型（本库 5 个 OpenRouter 免费模型即取自该免费层）；具体额度以官网为准，本文不列具体数字 | 具体额度以官网为准，本文不列具体数字 |
+| 部署成本 | Cloudflare Workers + KV 免费层覆盖个人使用，$0/月 | 具体以官网为准，本文不列具体数字 | 具体以官网为准，本文不列具体数字 |
+| 多账号轮换 | Qwen 多账号轮换，按失败原因分级冷却并自动恢复 | 是否支持以官网为准 | 是否支持以官网为准 |
 
 ## Development
 
